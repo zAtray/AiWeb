@@ -1,0 +1,21 @@
+{
+  "profile": "medium",
+  "generated_at": "2026-07-26T02:07:06.111Z",
+  "elapsed_ms": 240,
+  "demo_login": {
+    "account": "demo_001",
+    "password": "Demo@123"
+  },
+  "counts": {
+    "users": 41,
+    "knowledge_bases": 18,
+    "documents": 300,
+    "document_chunks": 4500,
+    "likes": 2249,
+    "favorites": 1672,
+    "comments": 1600,
+    "search_logs": 6000,
+    "chat_sessions": 500,
+    "messages": 1000
+  }
+}

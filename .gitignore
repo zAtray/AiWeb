@@ -1,0 +1,11 @@
+node_modules/
+frontend/dist/
+server/dist/
+coverage/
+data/*
+!data/seed-report.json
+!data/stress-report.json
+!data/uploads/
+data/uploads/*
+!data/uploads/.gitkeep
+.env

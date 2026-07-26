@@ -1,0 +1,43 @@
+{
+  "generated_at": "2026-07-26T02:08:15.232Z",
+  "requests": 2000,
+  "concurrency": 40,
+  "elapsed_seconds": 59.42,
+  "throughput_rps": 33.7,
+  "errors": 0,
+  "error_rate_percent": 0,
+  "latency_ms": {
+    "average": 1187.6,
+    "p50": 1186.2,
+    "p95": 1238.3,
+    "p99": 1268.8,
+    "max": 1280.2
+  },
+  "endpoints": {
+    "/api/search": {
+      "requests": 1000,
+      "errors": 0,
+      "p95_ms": 1238.2
+    },
+    "/api/documents": {
+      "requests": 500,
+      "errors": 0,
+      "p95_ms": 1238.2
+    },
+    "/api/stats": {
+      "requests": 300,
+      "errors": 0,
+      "p95_ms": 1238.4
+    },
+    "/api/chat/ask": {
+      "requests": 200,
+      "errors": 0,
+      "p95_ms": 1240.9
+    }
+  },
+  "pass": true,
+  "threshold": {
+    "error_count": 0,
+    "p95_ms": 2500
+  }
+}
