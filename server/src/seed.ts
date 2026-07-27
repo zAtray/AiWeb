@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { hashPassword } from "./auth.js";
 import { dataDirectory, uploadDirectory } from "./config.js";
-import { getDb, nowIso, transaction } from "./db.js";
+import { getDb, initDb, nowIso, transaction } from "./db.js";
 
 type Profile = "small" | "medium" | "large";
 
@@ -104,6 +104,7 @@ async function removeOldDemoFiles(): Promise<void> {
 async function main(): Promise<void> {
   const startedAt = performance.now();
   const db = getDb();
+  await initDb();
   await removeOldDemoFiles();
 
   const passwordHash = hashPassword("Demo@123");
@@ -111,16 +112,16 @@ async function main(): Promise<void> {
   const kbIds: number[] = [];
   const documentIds: number[] = [];
 
-  transaction(() => {
-    db.prepare("DELETE FROM search_logs WHERE mode='demo'").run();
-    db.prepare("DELETE FROM users WHERE username LIKE 'demo_%'").run();
+  await transaction(async () => {
+    await db.prepare("DELETE FROM search_logs WHERE mode='demo'").run();
+    await db.prepare("DELETE FROM users WHERE username LIKE 'demo_%'").run();
 
     const insertUser = db.prepare(
       `INSERT INTO users(username,email,password_hash,role,created_at)
        VALUES (?,?,?,?,?)`,
     );
     for (let index = 1; index <= profile.users; index += 1) {
-      const result = insertUser.run(
+      const result = await insertUser.run(
         `demo_${String(index).padStart(3, "0")}`,
         `demo${index}@example.test`,
         passwordHash,
@@ -137,7 +138,7 @@ async function main(): Promise<void> {
     );
     for (let index = 1; index <= profile.knowledgeBases; index += 1) {
       const date = randomDate();
-      const result = insertKb.run(
+      const result = await insertKb.run(
         pick(userIds),
         `[演示] ${pick(topics)}资料库 ${index}`,
         "压力测试与课程验机使用的可重复演示数据",
@@ -164,7 +165,7 @@ async function main(): Promise<void> {
     files.map((file) => fs.writeFile(file.storedPath, file.content, "utf8")),
   );
 
-  transaction(() => {
+  await transaction(async () => {
     const insertDocument = db.prepare(
       `INSERT INTO documents(
         owner_id,title,filename,stored_path,file_type,file_size,category,tags,
@@ -181,7 +182,7 @@ async function main(): Promise<void> {
        VALUES (?,?,?)`,
     );
     const assignKb = db.prepare(
-      `INSERT OR IGNORE INTO kb_documents(
+      `INSERT IGNORE INTO kb_documents(
         knowledge_base_id,document_id,added_at
        ) VALUES (?,?,?)`,
     );
@@ -194,7 +195,7 @@ async function main(): Promise<void> {
           : file.index % 5 === 0
             ? "private"
             : "shared";
-      const result = insertDocument.run(
+      const result = await insertDocument.run(
         pick(userIds),
         `[演示] ${file.topic}案例 ${file.index}`,
         path.basename(file.storedPath),
@@ -212,7 +213,7 @@ async function main(): Promise<void> {
       );
       const documentId = Number(result.lastInsertRowid);
       documentIds.push(documentId);
-      insertVersion.run(
+      await insertVersion.run(
         documentId,
         path.basename(file.storedPath),
         file.storedPath,
@@ -225,37 +226,37 @@ async function main(): Promise<void> {
         chunkIndex += 1
       ) {
         const secondaryTopic = topics[(file.index + chunkIndex) % topics.length]!;
-        insertChunk.run(
+        await insertChunk.run(
           documentId,
           chunkIndex,
           `${file.content}\n\n片段 ${chunkIndex + 1} 重点说明${secondaryTopic}的实现、测试与验收方法。`,
         );
       }
-      assignKb.run(pick(kbIds), documentId, date);
-      assignKb.run(pick(kbIds), documentId, date);
+      await assignKb.run(pick(kbIds), documentId, date);
+      await assignKb.run(pick(kbIds), documentId, date);
     }
 
-    const insertRelation = (
+    const insertRelation = async (
       table: "likes" | "favorites",
       total: number,
-    ): void => {
+    ): Promise<void> => {
       const statement = db.prepare(
-        `INSERT OR IGNORE INTO ${table}(user_id,document_id,created_at)
+        `INSERT IGNORE INTO ${table}(user_id,document_id,created_at)
          VALUES (?,?,?)`,
       );
       for (let index = 0; index < total; index += 1) {
-        statement.run(pick(userIds), pick(documentIds), randomDate());
+        await statement.run(pick(userIds), pick(documentIds), randomDate());
       }
     };
-    insertRelation("likes", profile.likes);
-    insertRelation("favorites", profile.favorites);
+    await insertRelation("likes", profile.likes);
+    await insertRelation("favorites", profile.favorites);
 
     const insertComment = db.prepare(
       `INSERT INTO comments(user_id,document_id,content,created_at)
        VALUES (?,?,?,?)`,
     );
     for (let index = 0; index < profile.comments; index += 1) {
-      insertComment.run(
+      await insertComment.run(
         pick(userIds),
         pick(documentIds),
         `演示评论 ${index + 1}：该资料对${pick(topics)}的说明很清楚。`,
@@ -268,7 +269,7 @@ async function main(): Promise<void> {
        VALUES (?,?,'demo',?)`,
     );
     for (let index = 0; index < profile.searchLogs; index += 1) {
-      insertLog.run(pick(userIds), pick(topics), randomDate(30));
+      await insertLog.run(pick(userIds), pick(topics), randomDate(30));
     }
 
     const insertSession = db.prepare(
@@ -283,7 +284,7 @@ async function main(): Promise<void> {
     for (let index = 0; index < profile.chatSessions; index += 1) {
       const topic = pick(topics);
       const date = randomDate(30);
-      const session = insertSession.run(
+      const session = await insertSession.run(
         pick(userIds),
         pick(kbIds),
         `${topic}如何实现？`,
@@ -291,8 +292,14 @@ async function main(): Promise<void> {
         date,
       );
       const sessionId = Number(session.lastInsertRowid);
-      insertMessage.run(sessionId, "user", `${topic}如何实现？`, "[]", date);
-      insertMessage.run(
+      await insertMessage.run(
+        sessionId,
+        "user",
+        `${topic}如何实现？`,
+        "[]",
+        date,
+      );
+      await insertMessage.run(
         sessionId,
         "assistant",
         `根据演示知识库，${topic}需要结合需求、代码和测试数据进行验证。[1]`,
@@ -309,7 +316,7 @@ async function main(): Promise<void> {
     }
   });
 
-  const counts = Object.fromEntries(
+  const countEntries = await Promise.all(
     [
       "users",
       "knowledge_bases",
@@ -321,17 +328,14 @@ async function main(): Promise<void> {
       "search_logs",
       "chat_sessions",
       "messages",
-    ].map((table) => [
-      table,
-      Number(
-        (
-          db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as {
-            count: number;
-          }
-        ).count,
-      ),
-    ]),
+    ].map(async (table) => {
+      const row = await db
+        .prepare(`SELECT COUNT(*) AS count FROM ${table}`)
+        .get();
+      return [table, Number(row?.count ?? 0)] as const;
+    }),
   );
+  const counts = Object.fromEntries(countEntries);
   const report = {
     profile: profileName,
     generated_at: nowIso(),
@@ -347,4 +351,3 @@ async function main(): Promise<void> {
 }
 
 await main();
-

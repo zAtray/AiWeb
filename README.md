@@ -4,7 +4,7 @@
 
 - 前端：Vue 3 + TypeScript + Vite，响应式 PC / 移动端界面
 - 服务端：Node.js 24 + Express 5 + TypeScript
-- 数据库：Node.js 内置 SQLite，默认文件为 `data/knowledge.db`
+- 数据库：MySQL 8.4，使用 `mysql2` 连接池
 - 文档解析：PDF、DOCX、TXT、Markdown，单文件默认上限 20 MB
 - 当前答案引擎：本地全文检索摘要，不包含远程连接家中台式机 Qwen 的网络调用
 
@@ -22,7 +22,7 @@
 
 ## 启动
 
-需要 Node.js 24 或更高版本。
+需要 Node.js 24 或更高版本，以及可访问的 MySQL 8 数据库。
 
 ```powershell
 npm install
@@ -49,6 +49,19 @@ npm run dev
 
 正式使用前请通过 `ADMIN_PASSWORD` 环境变量修改默认密码。其他配置见
 `.env.example`。
+
+数据库连接通过 `.env` 配置：
+
+```text
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=knowledge_app
+DB_PASSWORD=你的数据库密码
+DB_NAME=zhizhi_knowledge
+```
+
+项目启动时会在指定数据库中执行 `CREATE TABLE IF NOT EXISTS`，不会删除
+已有表或数据。
 
 ## 验证
 
@@ -108,7 +121,7 @@ npm run test:stress
 - `app.ts`：只负责 HTTP 路由和业务流程
 - `core.ts`：参数校验和数据序列化
 - `services.ts`：权限、文档查询和全文检索
-- `db.ts`：SQLite 表结构与事务
+- `db.ts`：MySQL 连接池、表结构与事务
 - `seed.ts`：可重复演示数据
 - `stress.ts`：无额外工具依赖的并发压力测试
 
@@ -148,7 +161,7 @@ npm run dev
 
 ```text
 frontend/        Vue 3 + TypeScript 前端
-server/src/      Express + TypeScript API、SQLite、文档解析与检索
+server/src/      Express + TypeScript API、MySQL、文档解析与检索
 data/uploads/    上传文件（不会提交到 Git）
 start.ps1        生产构建启动脚本
 ```

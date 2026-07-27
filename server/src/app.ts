@@ -31,7 +31,13 @@ import {
   tagsFromJson,
   text,
 } from "./core.js";
-import { getDb, nowIso, transaction } from "./db.js";
+import {
+  databaseInfo,
+  getDb,
+  initDb,
+  nowIso,
+  transaction,
+} from "./db.js";
 import { extractText } from "./documents.js";
 import {
   answerWithOllama,
@@ -61,17 +67,22 @@ const upload = multer({
   limits: { fileSize: maxUploadBytes },
 });
 
-export function createApp() {
-  seedAdmin();
+export async function createApp() {
+  await initDb();
+  await seedAdmin();
   const app = express();
   app.use(cors({ origin: true, credentials: true }));
   app.use(express.json({ limit: "1mb" }));
 
-  app.get("/api/health", (_request, response) => {
+  app.get("/api/health", async (_request, response) => {
+    const mysql = await databaseInfo();
     const modelEnabled = localModelEnabled();
     response.json({
       status: "ok",
       app: "智知",
+      database: "mysql",
+      database_name: mysql.database,
+      database_version: mysql.version,
       answer_engine: modelEnabled ? "local-qwen3-rag" : "local-extractive",
       local_model_configured: modelEnabled,
       local_model: modelEnabled ? localModelName() : null,
@@ -79,46 +90,48 @@ export function createApp() {
     });
   });
 
-  app.post("/api/auth/register", (request, response) => {
+  app.post("/api/auth/register", async (request, response) => {
     const username = text(request.body?.username, "用户名", 32);
     const password = text(request.body?.password, "密码", 128);
     if (password.length < 6) throw new ApiError(400, "密码至少需要 6 位");
     const email = optionalText(request.body?.email, 120) || null;
     const phone = optionalText(request.body?.phone, 30) || null;
     const db = getDb();
-    const duplicate = db
+    const duplicate = await db
       .prepare(
         `SELECT id FROM users WHERE username=?
          OR (? IS NOT NULL AND email=?) OR (? IS NOT NULL AND phone=?)`,
       )
       .get(username, email, email, phone, phone);
     if (duplicate) throw new ApiError(409, "用户名、邮箱或手机号已被使用");
-    const result = db
+    const result = await db
       .prepare(
         `INSERT INTO users(username,email,phone,password_hash,role,created_at)
          VALUES (?,?,?,?,?,?)`,
       )
       .run(username, email, phone, hashPassword(password), "user", nowIso());
     const id = Number(result.lastInsertRowid);
-    const row = db.prepare("SELECT * FROM users WHERE id=?").get(id) as SqlRow;
+    const row = (await db
+      .prepare("SELECT * FROM users WHERE id=?")
+      .get(id)) as SqlRow;
     response
       .status(201)
-      .json({ token: createSession(id), user: publicUser(row) });
+      .json({ token: await createSession(id), user: publicUser(row) });
   });
 
-  app.post("/api/auth/login", (request, response) => {
+  app.post("/api/auth/login", async (request, response) => {
     const account = text(request.body?.account, "账号", 120);
     const password = text(request.body?.password, "密码", 128);
-    const row = getDb()
+    const row = (await getDb()
       .prepare(
         "SELECT * FROM users WHERE username=? OR email=? OR phone=?",
       )
-      .get(account, account, account) as SqlRow | undefined;
+      .get(account, account, account)) as SqlRow | undefined;
     if (!row || !verifyPassword(password, String(row.password_hash))) {
       throw new ApiError(401, "账号或密码错误");
     }
     response.json({
-      token: createSession(Number(row.id)),
+      token: await createSession(Number(row.id)),
       user: publicUser(row),
     });
   });
@@ -126,10 +139,10 @@ export function createApp() {
   app.post(
     "/api/auth/logout",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const tokenHash = tokenHashFromRequest(request);
       if (tokenHash) {
-        getDb()
+        await getDb()
           .prepare("DELETE FROM auth_sessions WHERE token_hash=?")
           .run(tokenHash);
       }
@@ -140,13 +153,13 @@ export function createApp() {
   app.get(
     "/api/auth/me",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       response.json(userOf(request));
     },
   );
 
-  app.get("/api/admin/users", requireAdmin, (_request, response) => {
-    const rows = getDb()
+  app.get("/api/admin/users", requireAdmin, async (_request, response) => {
+    const rows = await getDb()
       .prepare(
         `SELECT u.id,u.username,u.email,u.phone,u.role,u.created_at,
           (SELECT COUNT(*) FROM documents d WHERE d.owner_id=u.id) AS document_count
@@ -159,7 +172,7 @@ export function createApp() {
   app.patch(
     "/api/admin/users/:id/role",
     requireSystemAdmin,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
       const role = request.body?.role as UserRole;
       if (!["user", "department_admin", "system_admin"].includes(role)) {
@@ -168,7 +181,7 @@ export function createApp() {
       if (id === userOf(request).id && role !== "system_admin") {
         throw new ApiError(400, "不能移除自己的系统管理员角色");
       }
-      const result = getDb()
+      const result = await getDb()
         .prepare("UPDATE users SET role=? WHERE id=?")
         .run(role, id);
       if (!result.changes) throw new ApiError(404, "用户不存在");
@@ -179,10 +192,10 @@ export function createApp() {
   app.get(
     "/api/knowledge-bases",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const user = userOf(request);
       const admin = ["department_admin", "system_admin"].includes(user.role);
-      const rows = getDb()
+      const rows = await getDb()
         .prepare(
           `SELECT k.*,u.username AS owner_name,
              COUNT(kd.document_id) AS document_count
@@ -199,7 +212,7 @@ export function createApp() {
   app.post(
     "/api/knowledge-bases",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const user = userOf(request);
       const name = text(request.body?.name, "知识库名称", 80);
       const description = optionalText(request.body?.description, 500);
@@ -209,7 +222,7 @@ export function createApp() {
       }
       const timestamp = nowIso();
       try {
-        const result = getDb()
+        const result = await getDb()
           .prepare(
             `INSERT INTO knowledge_bases(
               owner_id,name,description,visibility,created_at,updated_at
@@ -223,12 +236,15 @@ export function createApp() {
             timestamp,
             timestamp,
           );
-        const row = getDb()
+        const row = await getDb()
           .prepare("SELECT * FROM knowledge_bases WHERE id=?")
           .get(result.lastInsertRowid);
         response.status(201).json(row);
       } catch (error) {
-        if (String(error).includes("UNIQUE")) {
+        if (
+          (error as { code?: string }).code === "ER_DUP_ENTRY" ||
+          String(error).includes("UNIQUE")
+        ) {
           throw new ApiError(409, "你已有同名知识库");
         }
         throw error;
@@ -239,24 +255,24 @@ export function createApp() {
   app.put(
     "/api/knowledge-bases/:id",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
       const user = userOf(request);
-      canAccessKnowledgeBase(id, user, true);
+      await canAccessKnowledgeBase(id, user, true);
       const name = text(request.body?.name, "知识库名称", 80);
       const description = optionalText(request.body?.description, 500);
       const visibility = String(request.body?.visibility ?? "private");
       if (!["private", "shared", "public"].includes(visibility)) {
         throw new ApiError(400, "访问权限无效");
       }
-      getDb()
+      await getDb()
         .prepare(
           `UPDATE knowledge_bases
            SET name=?,description=?,visibility=?,updated_at=? WHERE id=?`,
         )
         .run(name, description, visibility, nowIso(), id);
       response.json(
-        getDb().prepare("SELECT * FROM knowledge_bases WHERE id=?").get(id),
+        await getDb().prepare("SELECT * FROM knowledge_bases WHERE id=?").get(id),
       );
     },
   );
@@ -264,10 +280,10 @@ export function createApp() {
   app.delete(
     "/api/knowledge-bases/:id",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
-      canAccessKnowledgeBase(id, userOf(request), true);
-      getDb().prepare("DELETE FROM knowledge_bases WHERE id=?").run(id);
+      await canAccessKnowledgeBase(id, userOf(request), true);
+      await getDb().prepare("DELETE FROM knowledge_bases WHERE id=?").run(id);
       response.status(204).end();
     },
   );
@@ -275,20 +291,20 @@ export function createApp() {
   app.post(
     "/api/knowledge-bases/:id/documents",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
       const documentId = Number(request.body?.document_id);
       const user = userOf(request);
-      canAccessKnowledgeBase(id, user, true);
-      canAccessDocument(documentId, user, true);
-      getDb()
+      await canAccessKnowledgeBase(id, user, true);
+      await canAccessDocument(documentId, user, true);
+      await getDb()
         .prepare(
-          `INSERT OR IGNORE INTO kb_documents(
+          `INSERT IGNORE INTO kb_documents(
             knowledge_base_id,document_id,added_at
            ) VALUES (?,?,?)`,
         )
         .run(id, documentId, nowIso());
-      getDb()
+      await getDb()
         .prepare("UPDATE knowledge_bases SET updated_at=? WHERE id=?")
         .run(nowIso(), id);
       response.status(201).json({ ok: true });
@@ -298,11 +314,11 @@ export function createApp() {
   app.delete(
     "/api/knowledge-bases/:id/documents/:documentId",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
       const documentId = numberId(request.params.documentId);
-      canAccessKnowledgeBase(id, userOf(request), true);
-      getDb()
+      await canAccessKnowledgeBase(id, userOf(request), true);
+      await getDb()
         .prepare(
           `DELETE FROM kb_documents
            WHERE knowledge_base_id=? AND document_id=?`,
@@ -315,7 +331,7 @@ export function createApp() {
   app.get(
     "/api/documents",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const user = userOf(request);
       const access = accessibleDocumentWhere(user);
       const clauses = [access.sql];
@@ -341,7 +357,7 @@ export function createApp() {
         parameters.push(`%"${tag}"%`);
       }
       if (knowledgeBaseId) {
-        canAccessKnowledgeBase(knowledgeBaseId, user);
+        await canAccessKnowledgeBase(knowledgeBaseId, user);
         join += " JOIN kb_documents kd ON kd.document_id=d.id";
         clauses.push("kd.knowledge_base_id=?");
         parameters.push(knowledgeBaseId);
@@ -364,12 +380,12 @@ export function createApp() {
             ? `(d.views+d.downloads*2+
                 (SELECT COUNT(*)*3 FROM likes l WHERE l.document_id=d.id)) DESC`
             : "d.updated_at DESC";
-      const rows = getDb()
+      const rows = (await getDb()
         .prepare(
           `${documentSelect} ${join}
            WHERE ${clauses.join(" AND ")} ORDER BY ${order}`,
         )
-        .all(user.id, user.id, ...parameters) as SqlRow[];
+        .all(user.id, user.id, ...parameters)) as SqlRow[];
       response.json(rows.map(documentJson));
     },
   );
@@ -395,11 +411,11 @@ export function createApp() {
           ? Number(request.body.knowledge_base_id)
           : undefined;
         if (knowledgeBaseId) {
-          canAccessKnowledgeBase(knowledgeBaseId, user, true);
+          await canAccessKnowledgeBase(knowledgeBaseId, user, true);
         }
         const timestamp = nowIso();
-        const created = transaction(() => {
-          const result = getDb()
+        const created = await transaction(async () => {
+          const result = await getDb()
             .prepare(
               `INSERT INTO documents(
                 owner_id,title,filename,stored_path,file_type,file_size,
@@ -420,7 +436,7 @@ export function createApp() {
               timestamp,
             );
           const documentId = Number(result.lastInsertRowid);
-          getDb()
+          await getDb()
             .prepare(
               `INSERT INTO document_versions(
                 document_id,version,filename,stored_path,file_size,created_at
@@ -433,9 +449,9 @@ export function createApp() {
               request.file!.size,
               timestamp,
             );
-          const chunkCount = replaceChunks(documentId, content);
+          const chunkCount = await replaceChunks(documentId, content);
           if (knowledgeBaseId) {
-            getDb()
+            await getDb()
               .prepare(
                 `INSERT INTO kb_documents(
                   knowledge_base_id,document_id,added_at
@@ -445,9 +461,9 @@ export function createApp() {
           }
           return { documentId, chunkCount };
         });
-        const row = getDb()
+        const row = (await getDb()
           .prepare(`${documentSelect} WHERE d.id=?`)
-          .get(user.id, user.id, created.documentId) as SqlRow;
+          .get(user.id, user.id, created.documentId)) as SqlRow;
         response
           .status(201)
           .json({ ...documentJson(row), chunk_count: created.chunkCount });
@@ -461,24 +477,24 @@ export function createApp() {
   app.get(
     "/api/documents/:id",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
       const user = userOf(request);
-      canAccessDocument(id, user);
-      getDb()
+      await canAccessDocument(id, user);
+      await getDb()
         .prepare("UPDATE documents SET views=views+1 WHERE id=?")
         .run(id);
-      const row = getDb()
+      const row = (await getDb()
         .prepare(`${documentSelect} WHERE d.id=?`)
-        .get(user.id, user.id, id) as SqlRow;
-      const knowledgeBases = getDb()
+        .get(user.id, user.id, id)) as SqlRow;
+      const knowledgeBases = await getDb()
         .prepare(
           `SELECT k.id,k.name FROM knowledge_bases k
            JOIN kb_documents kd ON kd.knowledge_base_id=k.id
            WHERE kd.document_id=? ORDER BY k.name`,
         )
         .all(id);
-      const versions = getDb()
+      const versions = await getDb()
         .prepare(
           `SELECT id,version,filename,file_size,created_at
            FROM document_versions WHERE document_id=?
@@ -496,23 +512,23 @@ export function createApp() {
   app.put(
     "/api/documents/:id",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
       const user = userOf(request);
-      canAccessDocument(id, user, true);
+      await canAccessDocument(id, user, true);
       const title = text(request.body?.title, "文档标题", 150);
       const category =
         optionalText(request.body?.category, 50) || "未分类";
       const tags = parseTags(request.body?.tags);
-      getDb()
+      await getDb()
         .prepare(
           `UPDATE documents SET title=?,category=?,tags=?,updated_at=?
            WHERE id=?`,
         )
         .run(title, category, JSON.stringify(tags), nowIso(), id);
-      const row = getDb()
+      const row = (await getDb()
         .prepare(`${documentSelect} WHERE d.id=?`)
-        .get(user.id, user.id, id) as SqlRow;
+        .get(user.id, user.id, id)) as SqlRow;
       response.json(documentJson(row));
     },
   );
@@ -525,16 +541,16 @@ export function createApp() {
       if (!request.file) throw new ApiError(400, "请选择版本文件");
       const id = numberId(request.params.id);
       const user = userOf(request);
-      const current = canAccessDocument(id, user, true);
+      const current = await canAccessDocument(id, user, true);
       const originalName = path.basename(request.file.originalname);
       const { storedPath, extension } = await persistUpload(request.file);
       try {
         const content = (await extractText(storedPath, extension)).trim();
         const nextVersion = Number(current.version) + 1;
-        const chunkCount = transaction(() => {
-          const count = replaceChunks(id, content);
+        const chunkCount = await transaction(async () => {
+          const count = await replaceChunks(id, content);
           const timestamp = nowIso();
-          getDb()
+          await getDb()
             .prepare(
               `UPDATE documents SET filename=?,stored_path=?,file_type=?,
                 file_size=?,version=?,text_content=?,updated_at=? WHERE id=?`,
@@ -549,7 +565,7 @@ export function createApp() {
               timestamp,
               id,
             );
-          getDb()
+          await getDb()
             .prepare(
               `INSERT INTO document_versions(
                 document_id,version,filename,stored_path,file_size,created_at
@@ -580,15 +596,15 @@ export function createApp() {
     requireUser,
     async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
-      canAccessDocument(id, userOf(request), true);
+      await canAccessDocument(id, userOf(request), true);
       const paths = (
-        getDb()
+        await getDb()
           .prepare(
             "SELECT stored_path FROM document_versions WHERE document_id=?",
           )
-          .all(id) as SqlRow[]
+          .all(id)
       ).map((row) => String(row.stored_path));
-      getDb().prepare("DELETE FROM documents WHERE id=?").run(id);
+      await getDb().prepare("DELETE FROM documents WHERE id=?").run(id);
       await Promise.all(
         [...new Set(paths)].map((file) => fsp.rm(file, { force: true })),
       );
@@ -599,10 +615,10 @@ export function createApp() {
   app.get(
     "/api/documents/:id/preview",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
-      const row = canAccessDocument(id, userOf(request));
-      getDb()
+      const row = await canAccessDocument(id, userOf(request));
+      await getDb()
         .prepare("UPDATE documents SET views=views+1 WHERE id=?")
         .run(id);
       response.type(String(row.file_type).toLowerCase());
@@ -617,10 +633,10 @@ export function createApp() {
   app.get(
     "/api/documents/:id/download",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
-      const row = canAccessDocument(id, userOf(request));
-      getDb()
+      const row = await canAccessDocument(id, userOf(request));
+      await getDb()
         .prepare("UPDATE documents SET downloads=downloads+1 WHERE id=?")
         .run(id);
       response.download(String(row.stored_path), String(row.filename));
@@ -630,15 +646,15 @@ export function createApp() {
   app.get(
     "/api/documents/:id/versions/:versionId/download",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
-      canAccessDocument(id, userOf(request));
-      const row = getDb()
+      await canAccessDocument(id, userOf(request));
+      const row = (await getDb()
         .prepare(
           `SELECT * FROM document_versions
            WHERE id=? AND document_id=?`,
         )
-        .get(numberId(request.params.versionId), id) as SqlRow | undefined;
+        .get(numberId(request.params.versionId), id)) as SqlRow | undefined;
       if (!row) throw new ApiError(404, "历史版本不存在");
       response.download(String(row.stored_path), String(row.filename));
     },
@@ -647,13 +663,13 @@ export function createApp() {
   app.get(
     "/api/search",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const query = text(request.query.q, "检索词", 500);
       const knowledgeBaseId = request.query.knowledge_base_id
         ? Number(request.query.knowledge_base_id)
         : undefined;
       const limit = Math.min(50, Math.max(1, Number(request.query.limit ?? 12)));
-      const results = searchChunks(userOf(request), query, {
+      const results = await searchChunks(userOf(request), query, {
         knowledgeBaseId,
         category:
           typeof request.query.category === "string"
@@ -665,7 +681,7 @@ export function createApp() {
             : undefined,
         limit,
       });
-      getDb()
+      await getDb()
         .prepare(
           `INSERT INTO search_logs(user_id,query,mode,created_at)
            VALUES (?,?,'fulltext',?)`,
@@ -678,13 +694,13 @@ export function createApp() {
   app.get(
     "/api/documents/:id/recommendations",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
       const user = userOf(request);
-      const source = canAccessDocument(id, user);
+      const source = await canAccessDocument(id, user);
       const access = accessibleDocumentWhere(user, "candidate");
       const tags = tagsFromJson(source.tags);
-      const rows = getDb()
+      const rows = (await getDb()
         .prepare(
           `SELECT candidate.id,candidate.title,candidate.category,candidate.tags,
              candidate.views,candidate.downloads,
@@ -700,7 +716,7 @@ export function createApp() {
           tags.length ? `%"${tags[0]}"%` : "[]",
           id,
           ...access.params,
-        ) as SqlRow[];
+        )) as SqlRow[];
       response.json(
         rows.map((row) => ({ ...row, tags: tagsFromJson(row.tags) })),
       );
@@ -719,8 +735,10 @@ export function createApp() {
       const requestedSessionId = request.body?.session_id
         ? Number(request.body.session_id)
         : undefined;
-      if (knowledgeBaseId) canAccessKnowledgeBase(knowledgeBaseId, user);
-      const contexts = searchChunks(user, question, {
+      if (knowledgeBaseId) {
+        await canAccessKnowledgeBase(knowledgeBaseId, user);
+      }
+      const contexts = await searchChunks(user, question, {
         knowledgeBaseId,
         limit: 5,
       });
@@ -740,17 +758,17 @@ export function createApp() {
         }
       }
       const timestamp = nowIso();
-      const sessionId = transaction(() => {
+      const sessionId = await transaction(async () => {
         let id = requestedSessionId;
         if (id) {
-          const session = getDb()
+          const session = await getDb()
             .prepare(
               "SELECT id FROM chat_sessions WHERE id=? AND user_id=?",
             )
             .get(id, user.id);
           if (!session) throw new ApiError(404, "问答会话不存在");
         } else {
-          const result = getDb()
+          const result = await getDb()
             .prepare(
               `INSERT INTO chat_sessions(
                 user_id,knowledge_base_id,title,created_at,updated_at
@@ -765,24 +783,24 @@ export function createApp() {
             );
           id = Number(result.lastInsertRowid);
         }
-        getDb()
+        await getDb()
           .prepare(
             `INSERT INTO messages(
               session_id,role,content,citations,created_at
              ) VALUES (?,'user',?,'[]',?)`,
           )
           .run(id, question, timestamp);
-        getDb()
+        await getDb()
           .prepare(
             `INSERT INTO messages(
               session_id,role,content,citations,created_at
              ) VALUES (?,'assistant',?,?,?)`,
           )
           .run(id, answer, JSON.stringify(citations), timestamp);
-        getDb()
+        await getDb()
           .prepare("UPDATE chat_sessions SET updated_at=? WHERE id=?")
           .run(timestamp, id);
-        getDb()
+        await getDb()
           .prepare(
             `INSERT INTO search_logs(user_id,query,mode,created_at)
              VALUES (?,?,'question',?)`,
@@ -802,8 +820,8 @@ export function createApp() {
   app.get(
     "/api/chat/sessions",
     requireUser,
-    (request: AuthRequest, response) => {
-      const rows = getDb()
+    async (request: AuthRequest, response) => {
+      const rows = await getDb()
         .prepare(
           `SELECT s.*,k.name AS knowledge_base_name,
              (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id) AS message_count
@@ -819,18 +837,18 @@ export function createApp() {
   app.get(
     "/api/chat/sessions/:id",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
-      const session = getDb()
+      const session = (await getDb()
         .prepare(
           "SELECT * FROM chat_sessions WHERE id=? AND user_id=?",
         )
-        .get(id, userOf(request).id) as SqlRow | undefined;
+        .get(id, userOf(request).id)) as SqlRow | undefined;
       if (!session) throw new ApiError(404, "问答会话不存在");
       const messages = (
-        getDb()
+        await getDb()
           .prepare("SELECT * FROM messages WHERE session_id=? ORDER BY id")
-          .all(id) as SqlRow[]
+          .all(id)
       ).map((row) => ({
         ...row,
         citations: JSON.parse(String(row.citations ?? "[]")),
@@ -842,8 +860,8 @@ export function createApp() {
   app.delete(
     "/api/chat/sessions/:id",
     requireUser,
-    (request: AuthRequest, response) => {
-      const result = getDb()
+    async (request: AuthRequest, response) => {
+      const result = await getDb()
         .prepare("DELETE FROM chat_sessions WHERE id=? AND user_id=?")
         .run(numberId(request.params.id), userOf(request).id);
       if (!result.changes) throw new ApiError(404, "问答会话不存在");
@@ -851,23 +869,23 @@ export function createApp() {
     },
   );
 
-  function toggleRelation(
+  async function toggleRelation(
     table: "favorites" | "likes",
     request: AuthRequest,
     response: Response,
-  ): void {
+  ): Promise<void> {
     const id = numberId(request.params.id);
     const user = userOf(request);
-    canAccessDocument(id, user);
-    const existing = getDb()
+    await canAccessDocument(id, user);
+    const existing = await getDb()
       .prepare(`SELECT 1 FROM ${table} WHERE user_id=? AND document_id=?`)
       .get(user.id, id);
     if (existing) {
-      getDb()
+      await getDb()
         .prepare(`DELETE FROM ${table} WHERE user_id=? AND document_id=?`)
         .run(user.id, id);
     } else {
-      getDb()
+      await getDb()
         .prepare(
           `INSERT INTO ${table}(user_id,document_id,created_at)
            VALUES (?,?,?)`,
@@ -875,10 +893,10 @@ export function createApp() {
         .run(user.id, id, nowIso());
     }
     const count = (
-      getDb()
+      await getDb()
         .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE document_id=?`)
-        .get(id) as SqlRow
-    ).count;
+        .get(id)
+    )!.count;
     response.json({ active: !existing, count: Number(count) });
   }
 
@@ -899,11 +917,11 @@ export function createApp() {
   app.get(
     "/api/documents/:id/comments",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
-      canAccessDocument(id, userOf(request));
+      await canAccessDocument(id, userOf(request));
       response.json(
-        getDb()
+        await getDb()
           .prepare(
             `SELECT c.*,u.username FROM comments c
              JOIN users u ON u.id=c.user_id
@@ -917,19 +935,19 @@ export function createApp() {
   app.post(
     "/api/documents/:id/comments",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
       const user = userOf(request);
-      canAccessDocument(id, user);
+      await canAccessDocument(id, user);
       const content = text(request.body?.content, "评论", 500);
-      const result = getDb()
+      const result = await getDb()
         .prepare(
           `INSERT INTO comments(user_id,document_id,content,created_at)
            VALUES (?,?,?,?)`,
         )
         .run(user.id, id, content, nowIso());
       response.status(201).json(
-        getDb()
+        await getDb()
           .prepare(
             `SELECT c.*,u.username FROM comments c
              JOIN users u ON u.id=c.user_id WHERE c.id=?`,
@@ -942,12 +960,12 @@ export function createApp() {
   app.delete(
     "/api/comments/:id",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
       const user = userOf(request);
-      const row = getDb()
+      const row = (await getDb()
         .prepare("SELECT * FROM comments WHERE id=?")
-        .get(id) as SqlRow | undefined;
+        .get(id)) as SqlRow | undefined;
       if (!row) throw new ApiError(404, "评论不存在");
       if (
         Number(row.user_id) !== user.id &&
@@ -955,7 +973,7 @@ export function createApp() {
       ) {
         throw new ApiError(403, "无权删除该评论");
       }
-      getDb().prepare("DELETE FROM comments WHERE id=?").run(id);
+      await getDb().prepare("DELETE FROM comments WHERE id=?").run(id);
       response.status(204).end();
     },
   );
@@ -963,10 +981,10 @@ export function createApp() {
   app.post(
     "/api/documents/:id/share",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
-      canAccessDocument(id, userOf(request), true);
-      getDb()
+      await canAccessDocument(id, userOf(request), true);
+      await getDb()
         .prepare(
           `UPDATE documents
            SET share_status='pending',share_note='',updated_at=? WHERE id=?`,
@@ -979,10 +997,10 @@ export function createApp() {
   app.delete(
     "/api/documents/:id/share",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const id = numberId(request.params.id);
-      canAccessDocument(id, userOf(request), true);
-      getDb()
+      await canAccessDocument(id, userOf(request), true);
+      await getDb()
         .prepare(
           `UPDATE documents
            SET share_status='private',share_note='',updated_at=? WHERE id=?`,
@@ -995,13 +1013,13 @@ export function createApp() {
   app.get(
     "/api/admin/share-requests",
     requireAdmin,
-    (_request, response) => {
-      const rows = getDb()
+    async (_request, response) => {
+      const rows = (await getDb()
         .prepare(
           `${documentSelect}
            WHERE d.share_status='pending' ORDER BY d.updated_at`,
         )
-        .all(0, 0) as SqlRow[];
+        .all(0, 0)) as SqlRow[];
       response.json(rows.map(documentJson));
     },
   );
@@ -1009,11 +1027,11 @@ export function createApp() {
   app.post(
     "/api/admin/documents/:id/review",
     requireAdmin,
-    (request, response) => {
+    async (request, response) => {
       const id = numberId(request.params.id);
       const approved = request.body?.approved === true;
       const note = optionalText(request.body?.note, 300);
-      const result = getDb()
+      const result = await getDb()
         .prepare(
           `UPDATE documents SET share_status=?,share_note=?,updated_at=?
            WHERE id=? AND share_status='pending'`,
@@ -1030,65 +1048,65 @@ export function createApp() {
   app.get(
     "/api/stats",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const user = userOf(request);
       const access = accessibleDocumentWhere(user);
-      const totals = getDb()
+      const totals = (await getDb()
         .prepare(
           `SELECT COUNT(*) AS documents,COALESCE(SUM(views),0) AS views,
              COALESCE(SUM(downloads),0) AS downloads
            FROM documents d WHERE ${access.sql}`,
         )
-        .get(...access.params) as SqlRow;
+        .get(...access.params)) as SqlRow;
       const admin = ["department_admin", "system_admin"].includes(user.role);
       const knowledgeBases = (
-        getDb()
+        await getDb()
           .prepare(
             admin
               ? "SELECT COUNT(*) AS count FROM knowledge_bases"
               : `SELECT COUNT(*) AS count FROM knowledge_bases
                  WHERE owner_id=? OR visibility IN ('shared','public')`,
           )
-          .get(...(admin ? [] : [user.id])) as SqlRow
-      ).count;
+          .get(...(admin ? [] : [user.id]))
+      )!.count;
       const questions = (
-        getDb()
+        await getDb()
           .prepare(
             `SELECT COUNT(*) AS count FROM messages m
              JOIN chat_sessions s ON s.id=m.session_id
              WHERE s.user_id=? AND m.role='user'`,
           )
-          .get(user.id) as SqlRow
-      ).count;
+          .get(user.id)
+      )!.count;
       const searches = (
-        getDb()
+        await getDb()
           .prepare(
             "SELECT COUNT(*) AS count FROM search_logs WHERE user_id=?",
           )
-          .get(user.id) as SqlRow
-      ).count;
-      const categories = getDb()
+          .get(user.id)
+      )!.count;
+      const categories = await getDb()
         .prepare(
           `SELECT category AS name,COUNT(*) AS value FROM documents d
            WHERE ${access.sql} GROUP BY category ORDER BY value DESC`,
         )
         .all(...access.params);
-      const hotKeywords = getDb()
+      const hotKeywords = await getDb()
         .prepare(
           `SELECT query AS name,COUNT(*) AS value FROM search_logs
            WHERE user_id=? GROUP BY query ORDER BY value DESC LIMIT 8`,
         )
         .all(user.id);
       const searchTrend = (
-        getDb()
+        await getDb()
           .prepare(
             `SELECT substr(created_at,1,10) AS date,COUNT(*) AS value
              FROM search_logs WHERE user_id=?
              GROUP BY substr(created_at,1,10) ORDER BY date DESC LIMIT 14`,
           )
-          .all(user.id) as SqlRow[]
+          .all(user.id)
       ).reverse();
-      const popularDocuments = getDb()
+      const popularDocuments = await getDb()
         .prepare(
           `SELECT d.id,d.title,d.views,d.downloads,
              (SELECT COUNT(*) FROM likes l WHERE l.document_id=d.id) AS likes
@@ -1099,7 +1117,7 @@ export function createApp() {
            ) DESC LIMIT 6`,
         )
         .all(...access.params);
-      const latestDocuments = getDb()
+      const latestDocuments = await getDb()
         .prepare(
           `SELECT d.id,d.title,d.category,d.created_at FROM documents d
            WHERE ${access.sql} ORDER BY d.created_at DESC LIMIT 6`,
@@ -1144,8 +1162,9 @@ export function createApp() {
         return;
       }
       if (
-        error instanceof Error &&
-        error.message.includes("UNIQUE constraint")
+        (error as { code?: string }).code === "ER_DUP_ENTRY" ||
+        (error instanceof Error &&
+          error.message.includes("UNIQUE constraint"))
       ) {
         response.status(409).json({ message: "数据已存在" });
         return;

@@ -1,179 +1,312 @@
-import { DatabaseSync, type StatementSync } from "node:sqlite";
-import { databasePath, ensureDirectories } from "./config.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  createPool,
+  type ExecuteValues,
+  type Pool,
+  type PoolConnection,
+  type ResultSetHeader,
+  type RowDataPacket,
+} from "mysql2/promise";
+import {
+  dbConnectionLimit,
+  dbHost,
+  dbName,
+  dbPassword,
+  dbPort,
+  dbUser,
+  ensureDirectories,
+} from "./config.js";
+import type { SqlRow } from "./types.js";
 
-let database: DatabaseSync | undefined;
+export interface RunResult {
+  lastInsertRowid: number;
+  changes: number;
+}
+
+type QueryExecutor = Pool | PoolConnection;
+
+let pool: Pool | undefined;
+let initialized = false;
+const transactionContext = new AsyncLocalStorage<PoolConnection>();
 
 const schema = `
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
-
 CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT NOT NULL UNIQUE,
-  email TEXT UNIQUE,
-  phone TEXT UNIQUE,
-  password_hash TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'user'
-    CHECK(role IN ('user','department_admin','system_admin')),
-  created_at TEXT NOT NULL
-);
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(32) NOT NULL UNIQUE,
+  email VARCHAR(120) NULL UNIQUE,
+  phone VARCHAR(30) NULL UNIQUE,
+  password_hash VARCHAR(255) NOT NULL,
+  role ENUM('user','department_admin','system_admin') NOT NULL DEFAULT 'user',
+  created_at VARCHAR(32) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS auth_sessions (
-  token_hash TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
+  token_hash CHAR(64) NOT NULL PRIMARY KEY,
+  user_id BIGINT UNSIGNED NOT NULL,
+  expires_at VARCHAR(32) NOT NULL,
+  created_at VARCHAR(32) NOT NULL,
+  CONSTRAINT fk_auth_sessions_user
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS knowledge_bases (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  visibility TEXT NOT NULL DEFAULT 'private'
-    CHECK(visibility IN ('private','shared','public')),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  UNIQUE(owner_id,name)
-);
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  owner_id BIGINT UNSIGNED NOT NULL,
+  name VARCHAR(80) NOT NULL,
+  description VARCHAR(500) NOT NULL DEFAULT '',
+  visibility ENUM('private','shared','public') NOT NULL DEFAULT 'private',
+  created_at VARCHAR(32) NOT NULL,
+  updated_at VARCHAR(32) NOT NULL,
+  UNIQUE KEY uq_knowledge_bases_owner_name (owner_id,name),
+  CONSTRAINT fk_knowledge_bases_owner
+    FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS documents (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  filename TEXT NOT NULL,
-  stored_path TEXT NOT NULL,
-  file_type TEXT NOT NULL,
-  file_size INTEGER NOT NULL,
-  category TEXT NOT NULL DEFAULT '未分类',
-  tags TEXT NOT NULL DEFAULT '[]',
-  version INTEGER NOT NULL DEFAULT 1,
-  text_content TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'ready',
-  share_status TEXT NOT NULL DEFAULT 'private'
-    CHECK(share_status IN ('private','pending','shared','rejected')),
-  share_note TEXT NOT NULL DEFAULT '',
-  views INTEGER NOT NULL DEFAULT 0,
-  downloads INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  owner_id BIGINT UNSIGNED NOT NULL,
+  title VARCHAR(150) NOT NULL,
+  filename VARCHAR(255) NOT NULL,
+  stored_path VARCHAR(1024) NOT NULL,
+  file_type VARCHAR(16) NOT NULL,
+  file_size BIGINT UNSIGNED NOT NULL,
+  category VARCHAR(50) NOT NULL DEFAULT '未分类',
+  tags LONGTEXT NOT NULL,
+  version INT UNSIGNED NOT NULL DEFAULT 1,
+  text_content LONGTEXT NOT NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'ready',
+  share_status ENUM('private','pending','shared','rejected')
+    NOT NULL DEFAULT 'private',
+  share_note VARCHAR(300) NOT NULL DEFAULT '',
+  views BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  downloads BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  created_at VARCHAR(32) NOT NULL,
+  updated_at VARCHAR(32) NOT NULL,
+  KEY idx_documents_owner (owner_id),
+  KEY idx_documents_category (category),
+  KEY idx_documents_share (share_status),
+  CONSTRAINT fk_documents_owner
+    FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS document_versions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  version INTEGER NOT NULL,
-  filename TEXT NOT NULL,
-  stored_path TEXT NOT NULL,
-  file_size INTEGER NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE(document_id,version)
-);
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  document_id BIGINT UNSIGNED NOT NULL,
+  version INT UNSIGNED NOT NULL,
+  filename VARCHAR(255) NOT NULL,
+  stored_path VARCHAR(1024) NOT NULL,
+  file_size BIGINT UNSIGNED NOT NULL,
+  created_at VARCHAR(32) NOT NULL,
+  UNIQUE KEY uq_document_versions_document_version (document_id,version),
+  CONSTRAINT fk_document_versions_document
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS kb_documents (
-  knowledge_base_id INTEGER NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
-  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  added_at TEXT NOT NULL,
-  PRIMARY KEY(knowledge_base_id,document_id)
-);
+  knowledge_base_id BIGINT UNSIGNED NOT NULL,
+  document_id BIGINT UNSIGNED NOT NULL,
+  added_at VARCHAR(32) NOT NULL,
+  PRIMARY KEY (knowledge_base_id,document_id),
+  KEY idx_kb_documents_document (document_id),
+  CONSTRAINT fk_kb_documents_knowledge_base
+    FOREIGN KEY (knowledge_base_id) REFERENCES knowledge_bases(id)
+      ON DELETE CASCADE,
+  CONSTRAINT fk_kb_documents_document
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS document_chunks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  chunk_index INTEGER NOT NULL,
-  content TEXT NOT NULL,
-  UNIQUE(document_id,chunk_index)
-);
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  document_id BIGINT UNSIGNED NOT NULL,
+  chunk_index INT UNSIGNED NOT NULL,
+  content LONGTEXT NOT NULL,
+  UNIQUE KEY uq_document_chunks_document_index (document_id,chunk_index),
+  KEY idx_chunks_document (document_id),
+  CONSTRAINT fk_document_chunks_document
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS chat_sessions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  knowledge_base_id INTEGER REFERENCES knowledge_bases(id) ON DELETE SET NULL,
-  title TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  user_id BIGINT UNSIGNED NOT NULL,
+  knowledge_base_id BIGINT UNSIGNED NULL,
+  title VARCHAR(255) NOT NULL,
+  created_at VARCHAR(32) NOT NULL,
+  updated_at VARCHAR(32) NOT NULL,
+  CONSTRAINT fk_chat_sessions_user
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_chat_sessions_knowledge_base
+    FOREIGN KEY (knowledge_base_id) REFERENCES knowledge_bases(id)
+      ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
-  role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-  content TEXT NOT NULL,
-  citations TEXT NOT NULL DEFAULT '[]',
-  created_at TEXT NOT NULL
-);
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  session_id BIGINT UNSIGNED NOT NULL,
+  role ENUM('user','assistant') NOT NULL,
+  content LONGTEXT NOT NULL,
+  citations LONGTEXT NOT NULL,
+  created_at VARCHAR(32) NOT NULL,
+  KEY idx_messages_session (session_id),
+  CONSTRAINT fk_messages_session
+    FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS favorites (
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  created_at TEXT NOT NULL,
-  PRIMARY KEY(user_id,document_id)
-);
+  user_id BIGINT UNSIGNED NOT NULL,
+  document_id BIGINT UNSIGNED NOT NULL,
+  created_at VARCHAR(32) NOT NULL,
+  PRIMARY KEY (user_id,document_id),
+  CONSTRAINT fk_favorites_user
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_favorites_document
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS likes (
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  created_at TEXT NOT NULL,
-  PRIMARY KEY(user_id,document_id)
-);
+  user_id BIGINT UNSIGNED NOT NULL,
+  document_id BIGINT UNSIGNED NOT NULL,
+  created_at VARCHAR(32) NOT NULL,
+  PRIMARY KEY (user_id,document_id),
+  CONSTRAINT fk_likes_user
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_likes_document
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS comments (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  content TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  user_id BIGINT UNSIGNED NOT NULL,
+  document_id BIGINT UNSIGNED NOT NULL,
+  content VARCHAR(500) NOT NULL,
+  created_at VARCHAR(32) NOT NULL,
+  CONSTRAINT fk_comments_user
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_comments_document
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS search_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  query TEXT NOT NULL,
-  mode TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents(owner_id);
-CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(category);
-CREATE INDEX IF NOT EXISTS idx_documents_share ON documents(share_status);
-CREATE INDEX IF NOT EXISTS idx_chunks_document ON document_chunks(document_id);
-CREATE INDEX IF NOT EXISTS idx_kb_documents_document ON kb_documents(document_id);
-CREATE INDEX IF NOT EXISTS idx_search_query ON search_logs(query);
-CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  user_id BIGINT UNSIGNED NULL,
+  query VARCHAR(500) NOT NULL,
+  mode VARCHAR(32) NOT NULL,
+  created_at VARCHAR(32) NOT NULL,
+  KEY idx_search_query (query),
+  CONSTRAINT fk_search_logs_user
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 `;
+
+function executor(): QueryExecutor {
+  return transactionContext.getStore() ?? getPool();
+}
+
+function getPool(): Pool {
+  if (!pool) {
+    pool = createPool({
+      host: dbHost,
+      port: dbPort,
+      user: dbUser,
+      password: dbPassword,
+      database: dbName,
+      waitForConnections: true,
+      connectionLimit: dbConnectionLimit,
+      queueLimit: 0,
+      charset: "utf8mb4",
+      multipleStatements: true,
+      decimalNumbers: true,
+    });
+  }
+  return pool;
+}
+
+class Statement {
+  constructor(private readonly sql: string) {}
+
+  async get(...parameters: ExecuteValues[]): Promise<SqlRow | undefined> {
+    const [rows] = await executor().execute<RowDataPacket[]>(
+      this.sql,
+      parameters,
+    );
+    return rows[0] as SqlRow | undefined;
+  }
+
+  async all(...parameters: ExecuteValues[]): Promise<SqlRow[]> {
+    const [rows] = await executor().execute<RowDataPacket[]>(
+      this.sql,
+      parameters,
+    );
+    return rows as SqlRow[];
+  }
+
+  async run(...parameters: ExecuteValues[]): Promise<RunResult> {
+    const [result] = await executor().execute<ResultSetHeader>(
+      this.sql,
+      parameters,
+    );
+    return {
+      lastInsertRowid: Number(result.insertId),
+      changes: Number(result.affectedRows),
+    };
+  }
+}
+
+export interface Database {
+  prepare(sql: string): Statement;
+}
+
+const database: Database = {
+  prepare(sql: string) {
+    return new Statement(sql);
+  },
+};
+
+export async function initDb(): Promise<void> {
+  if (initialized) return;
+  ensureDirectories();
+  await getPool().query(schema);
+  initialized = true;
+}
+
+export function getDb(): Database {
+  return database;
+}
 
 export function nowIso(): string {
   return new Date().toISOString();
 }
 
-export function getDb(): DatabaseSync {
-  if (!database) {
-    ensureDirectories();
-    database = new DatabaseSync(databasePath);
-    database.exec(schema);
-  }
-  return database;
-}
-
-export function prepare(sql: string): StatementSync {
-  return getDb().prepare(sql);
-}
-
-export function transaction<T>(work: () => T): T {
-  const db = getDb();
-  db.exec("BEGIN IMMEDIATE");
+export async function transaction<T>(work: () => Promise<T>): Promise<T> {
+  const connection = await getPool().getConnection();
   try {
-    const result = work();
-    db.exec("COMMIT");
+    await connection.beginTransaction();
+    const result = await transactionContext.run(connection, work);
+    await connection.commit();
     return result;
   } catch (error) {
-    db.exec("ROLLBACK");
+    await connection.rollback();
     throw error;
+  } finally {
+    connection.release();
   }
 }
 
-export function closeDb(): void {
-  database?.close();
-  database = undefined;
+export async function closeDb(): Promise<void> {
+  await pool?.end();
+  pool = undefined;
+  initialized = false;
 }
 
+export async function databaseInfo(): Promise<{
+  database: string;
+  version: string;
+}> {
+  const row = await getDb()
+    .prepare("SELECT DATABASE() AS database_name,VERSION() AS version")
+    .get();
+  return {
+    database: String(row?.database_name ?? ""),
+    version: String(row?.version ?? ""),
+  };
+}

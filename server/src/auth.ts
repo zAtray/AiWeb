@@ -49,13 +49,13 @@ export function publicUser(row: UserRow | Record<string, unknown>): User {
   };
 }
 
-export function createSession(userId: number): string {
+export async function createSession(userId: number): Promise<string> {
   const token = randomBytes(32).toString("base64url");
   const tokenHash = createHash("sha256").update(token).digest("hex");
   const expiresAt = new Date(
     Date.now() + sessionHours * 60 * 60 * 1000,
   ).toISOString();
-  getDb()
+  await getDb()
     .prepare(
       `INSERT INTO auth_sessions(token_hash,user_id,expires_at,created_at)
        VALUES (?,?,?,?)`,
@@ -71,17 +71,17 @@ export function tokenHashFromRequest(request: AuthRequest): string | null {
   return token ? createHash("sha256").update(token).digest("hex") : null;
 }
 
-export function requireUser(
+export async function requireUser(
   request: AuthRequest,
   response: Response,
   next: NextFunction,
-): void {
+): Promise<void> {
   const tokenHash = tokenHashFromRequest(request);
   if (!tokenHash) {
     response.status(401).json({ message: "请先登录" });
     return;
   }
-  const row = getDb()
+  const row = await getDb()
     .prepare(
       `SELECT u.id,u.username,u.email,u.phone,u.role,u.created_at
        FROM auth_sessions s JOIN users u ON u.id=s.user_id
@@ -96,12 +96,12 @@ export function requireUser(
   next();
 }
 
-export function requireAdmin(
+export async function requireAdmin(
   request: AuthRequest,
   response: Response,
   next: NextFunction,
-): void {
-  requireUser(request, response, () => {
+): Promise<void> {
+  await requireUser(request, response, () => {
     if (
       !request.user ||
       !["department_admin", "system_admin"].includes(request.user.role)
@@ -113,12 +113,12 @@ export function requireAdmin(
   });
 }
 
-export function requireSystemAdmin(
+export async function requireSystemAdmin(
   request: AuthRequest,
   response: Response,
   next: NextFunction,
-): void {
-  requireUser(request, response, () => {
+): Promise<void> {
+  await requireUser(request, response, () => {
     if (request.user?.role !== "system_admin") {
       response.status(403).json({ message: "需要系统管理员权限" });
       return;

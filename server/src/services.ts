@@ -18,10 +18,10 @@ import type {
   User,
 } from "./types.js";
 
-export function seedAdmin(): void {
+export async function seedAdmin(): Promise<void> {
   const db = getDb();
-  if (!db.prepare("SELECT id FROM users WHERE username='admin'").get()) {
-    db.prepare(
+  if (!(await db.prepare("SELECT id FROM users WHERE username='admin'").get())) {
+    await db.prepare(
       `INSERT INTO users(username,email,password_hash,role,created_at)
        VALUES (?,?,?,?,?)`,
     ).run(
@@ -39,12 +39,12 @@ export function userOf(request: AuthRequest): User {
   return request.user;
 }
 
-export function canAccessKnowledgeBase(
+export async function canAccessKnowledgeBase(
   id: number,
   user: User,
   write = false,
-): SqlRow {
-  const row = getDb()
+): Promise<SqlRow> {
+  const row = await getDb()
     .prepare("SELECT * FROM knowledge_bases WHERE id=?")
     .get(id) as SqlRow | undefined;
   if (!row) throw new ApiError(404, "知识库不存在");
@@ -60,12 +60,12 @@ export function canAccessKnowledgeBase(
   throw new ApiError(403, "无权访问该知识库");
 }
 
-export function canAccessDocument(
+export async function canAccessDocument(
   id: number,
   user: User,
   write = false,
-): SqlRow {
-  const row = getDb()
+): Promise<SqlRow> {
+  const row = await getDb()
     .prepare("SELECT * FROM documents WHERE id=?")
     .get(id) as SqlRow | undefined;
   if (!row) throw new ApiError(404, "文档不存在");
@@ -105,7 +105,10 @@ export const documentSelect = `
   FROM documents d JOIN users u ON u.id=d.owner_id
 `;
 
-export function replaceChunks(documentId: number, content: string): number {
+export async function replaceChunks(
+  documentId: number,
+  content: string,
+): Promise<number> {
   const chunks = chunkText(content);
   if (!chunks.length) {
     throw new ApiError(
@@ -114,11 +117,15 @@ export function replaceChunks(documentId: number, content: string): number {
     );
   }
   const db = getDb();
-  db.prepare("DELETE FROM document_chunks WHERE document_id=?").run(documentId);
+  await db
+    .prepare("DELETE FROM document_chunks WHERE document_id=?")
+    .run(documentId);
   const insert = db.prepare(
     "INSERT INTO document_chunks(document_id,chunk_index,content) VALUES (?,?,?)",
   );
-  chunks.forEach((chunk, index) => insert.run(documentId, index, chunk));
+  for (const [index, chunk] of chunks.entries()) {
+    await insert.run(documentId, index, chunk);
+  }
   return chunks.length;
 }
 
@@ -137,7 +144,7 @@ export async function persistUpload(
   return { storedPath, extension };
 }
 
-export function searchChunks(
+export async function searchChunks(
   user: User,
   query: string,
   options: {
@@ -146,13 +153,13 @@ export function searchChunks(
     tag?: string;
     limit?: number;
   } = {},
-): SearchHit[] {
+): Promise<SearchHit[]> {
   const access = accessibleDocumentWhere(user);
   const clauses = [access.sql];
   const parameters: Array<string | number> = [...access.params];
   let join = "";
   if (options.knowledgeBaseId) {
-    canAccessKnowledgeBase(options.knowledgeBaseId, user);
+    await canAccessKnowledgeBase(options.knowledgeBaseId, user);
     join = "JOIN kb_documents kd ON kd.document_id=d.id";
     clauses.push("kd.knowledge_base_id=?");
     parameters.push(options.knowledgeBaseId);
@@ -176,7 +183,7 @@ export function searchChunks(
       parameters.push(`%${term}%`, `%${term}%`, `%${term}%`);
     }
   }
-  const rows = getDb()
+  const rows = await getDb()
     .prepare(
       `SELECT c.id AS chunk_id,c.chunk_index,c.content,
         d.id AS document_id,d.title,d.category,d.tags,d.updated_at

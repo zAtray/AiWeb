@@ -41,7 +41,7 @@ async function login(baseUrl: string): Promise<string> {
 }
 
 async function main(): Promise<void> {
-  const app = createApp();
+  const app = await createApp();
   const server = await new Promise<Server>((resolve) => {
     const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
   });
@@ -154,4 +154,3 @@ async function main(): Promise<void> {
 }
 
 await main();
-

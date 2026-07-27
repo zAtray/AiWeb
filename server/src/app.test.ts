@@ -5,7 +5,8 @@ import supertest from "supertest";
 
 let temporaryDirectory = "";
 let request: ReturnType<typeof supertest>;
-let closeDatabase: () => void;
+let closeDatabase: () => Promise<void>;
+let databaseModule: typeof import("./db.js");
 let userToken = "";
 let documentId = 0;
 
@@ -15,16 +16,25 @@ beforeAll(async () => {
   );
   process.env.APP_DATA_DIR = temporaryDirectory;
   process.env.ADMIN_PASSWORD = "Admin@123";
-  const [{ createApp }, databaseModule] = await Promise.all([
+  const [appModule, loadedDatabaseModule] = await Promise.all([
     import("./app.js"),
     import("./db.js"),
   ]);
+  databaseModule = loadedDatabaseModule;
   closeDatabase = databaseModule.closeDb;
-  request = supertest(createApp());
+  request = supertest(await appModule.createApp());
+  await databaseModule
+    .getDb()
+    .prepare("DELETE FROM users WHERE username=?")
+    .run("student");
 });
 
 afterAll(async () => {
-  closeDatabase();
+  await databaseModule
+    .getDb()
+    .prepare("DELETE FROM users WHERE username=?")
+    .run("student");
+  await closeDatabase();
   await fs.rm(temporaryDirectory, { recursive: true, force: true });
 });
 
@@ -135,4 +145,3 @@ describe("实验二核心业务闭环", () => {
     expect(health.body.answer_engine).toBe("local-extractive");
   });
 });
-
