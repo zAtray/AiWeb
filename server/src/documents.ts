@@ -3,6 +3,16 @@ import path from "node:path";
 import mammoth from "mammoth";
 import pdf from "pdf-parse";
 
+export function normalizeUploadFilename(filename: string): string {
+  if (
+    [...filename].some((character) => (character.codePointAt(0) ?? 0) > 255)
+  ) {
+    return filename;
+  }
+  const decoded = Buffer.from(filename, "latin1").toString("utf8");
+  return decoded.includes("\uFFFD") ? filename : decoded;
+}
+
 export async function extractText(
   filePath: string,
   extension: string,
@@ -60,4 +70,3 @@ export function chunkText(
   if (current) chunks.push(current);
   return chunks;
 }
-

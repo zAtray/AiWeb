@@ -126,6 +126,17 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+  chunk_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+  model VARCHAR(120) NOT NULL,
+  dimensions INT UNSIGNED NOT NULL,
+  embedding LONGTEXT NOT NULL,
+  updated_at VARCHAR(32) NOT NULL,
+  KEY idx_chunk_embeddings_model (model),
+  CONSTRAINT fk_chunk_embeddings_chunk
+    FOREIGN KEY (chunk_id) REFERENCES document_chunks(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS chat_sessions (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   user_id BIGINT UNSIGNED NOT NULL,

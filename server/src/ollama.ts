@@ -60,6 +60,12 @@ export function localModelName(): string {
   return process.env.OLLAMA_MODEL?.trim() || "qwen3:8b";
 }
 
+export function ollamaBaseUrl(): string {
+  return (
+    process.env.OLLAMA_BASE_URL?.trim() || "http://127.0.0.1:11434"
+  ).replace(/\/+$/u, "");
+}
+
 export function buildEvidencePrompt(
   question: string,
   contexts: SearchHit[],
@@ -80,13 +86,10 @@ export async function answerWithOllama(
   question: string,
   contexts: SearchHit[],
 ): Promise<string> {
-  const baseUrl = (
-    process.env.OLLAMA_BASE_URL?.trim() || "http://127.0.0.1:11434"
-  ).replace(/\/+$/u, "");
   const timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS ?? 90_000);
   const numGpu = Number(process.env.OLLAMA_NUM_GPU ?? 99);
   const contextLength = Number(process.env.OLLAMA_NUM_CTX ?? 2048);
-  const response = await fetch(`${baseUrl}/api/chat`, {
+  const response = await fetch(`${ollamaBaseUrl()}/api/chat`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     signal: AbortSignal.timeout(timeoutMs),

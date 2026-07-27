@@ -8,7 +8,10 @@ import {
   tagsFromJson,
   text,
 } from "./core.js";
-import { chunkText } from "./documents.js";
+import {
+  chunkText,
+  normalizeUploadFilename,
+} from "./documents.js";
 import { extractiveAnswer, lexicalScore, queryTerms } from "./search.js";
 
 describe("公共逻辑单元测试", () => {
@@ -59,6 +62,16 @@ describe("公共逻辑单元测试", () => {
     expect(chunkText("   ")).toEqual([]);
   });
 
+  it("修复 multipart 对中文文件名的 Latin-1 误解码", () => {
+    expect(
+      normalizeUploadFilename(
+        "æå­æç¨¿1_å·²æ·»å åè½è¯´æ.docx",
+      ),
+    ).toBe("文字文稿1_已添加功能说明.docx");
+    expect(normalizeUploadFilename("课程资料.docx")).toBe("课程资料.docx");
+    expect(normalizeUploadFilename("resume-é.txt")).toBe("resume-é.txt");
+  });
+
   it("中文长查询会生成二字候选词", () => {
     expect(queryTerms("知识管理")).toEqual(
       expect.arrayContaining(["知识管理", "知识", "识管", "管理"]),
@@ -93,4 +106,3 @@ describe("公共逻辑单元测试", () => {
     expect(extractiveAnswer("未知问题", [])).toContain("没有检索到");
   });
 });
-

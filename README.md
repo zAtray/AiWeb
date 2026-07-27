@@ -125,21 +125,30 @@ npm run test:stress
 - `seed.ts`：可重复演示数据
 - `stress.ts`：无额外工具依赖的并发压力测试
 
-## 可选本地 Qwen GPU 问答
+## 可选 Qwen GPU 问答与向量检索
 
 `/api/chat/ask` 默认继续使用不依赖模型服务的 `local-extractive` 引擎。设置以下
-环境变量后，会把检索片段交给 Ollama 上的 Qwen3，并保存模型答案和对应引用；
-Ollama 超时或异常时会自动回退到抽取式回答。
+环境变量后，会用 Qwen3 Embedding 完成语义与关键词混合检索，再把检索片段交给
+Qwen3 生成答案，并保存模型答案和对应引用；Ollama 超时或异常时会自动回退到
+关键词检索和抽取式回答。
 
-```powershell
-$env:LOCAL_LLM_ENABLED = "true"
-$env:OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-$env:OLLAMA_MODEL = "qwen3:8b"
-$env:OLLAMA_NUM_GPU = "99"
-$env:OLLAMA_NUM_CTX = "2048"
-$env:OLLAMA_KEEP_ALIVE = "10m"
-npm run dev
+```dotenv
+LOCAL_LLM_ENABLED=true
+OLLAMA_BASE_URL=http://100.75.54.40:11434
+OLLAMA_MODEL=qwen3:8b
+OLLAMA_NUM_GPU=99
+OLLAMA_NUM_CTX=2048
+OLLAMA_KEEP_ALIVE=10m
+EMBEDDING_ENABLED=true
+OLLAMA_EMBEDDING_MODEL=qwen3-embedding:0.6b
+OLLAMA_EMBEDDING_BATCH_SIZE=16
+EMBEDDING_MIN_SCORE=0.35
 ```
+
+这里的 `100.75.54.40` 是示例 Windows Tailscale 地址，应替换为实际设备地址。
+服务启动后会在后台为尚未建立索引的文档片段补齐向量。新上传文档和新版本会立即
+生成向量并写入 MySQL 的 `chunk_embeddings` 表。该表使用 JSON 保存向量，当前
+方案不依赖 MySQL 向量插件。
 
 `OLLAMA_NUM_GPU=99` 会将包括输出层在内的模型放入 GPU。当前 RTX 3060 12GB
 使用 2048 上下文完成了连续 GPU 调用；更大的 4096 上下文在当前 Ollama

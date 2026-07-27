@@ -16,6 +16,8 @@ beforeAll(async () => {
   );
   process.env.APP_DATA_DIR = temporaryDirectory;
   process.env.ADMIN_PASSWORD = "Admin@123";
+  process.env.LOCAL_LLM_ENABLED = "false";
+  process.env.EMBEDDING_ENABLED = "false";
   const [appModule, loadedDatabaseModule] = await Promise.all([
     import("./app.js"),
     import("./db.js"),
@@ -143,5 +145,7 @@ describe("实验二核心业务闭环", () => {
     const health = await request.get("/api/health");
     expect(health.body.remote_model_configured).toBe(false);
     expect(health.body.answer_engine).toBe("local-extractive");
+    expect(health.body.retrieval_engine).toBe("lexical");
+    expect(health.body.embedding_model_configured).toBe(false);
   });
 });

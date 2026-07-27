@@ -10,6 +10,13 @@ import {
 import { ApiError, tagsFromJson } from "./core.js";
 import { getDb, nowIso } from "./db.js";
 import { chunkText } from "./documents.js";
+import {
+  cosineSimilarity,
+  embedTexts,
+  embeddingMinimumScore,
+  embeddingModelEnabled,
+  embeddingModelName,
+} from "./embeddings.js";
 import { lexicalScore, queryTerms } from "./search.js";
 import type {
   AuthRequest,
@@ -131,8 +138,9 @@ export async function replaceChunks(
 
 export async function persistUpload(
   file: Express.Multer.File,
+  originalName = file.originalname,
 ): Promise<{ storedPath: string; extension: string }> {
-  const extension = path.extname(file.originalname).toLowerCase();
+  const extension = path.extname(originalName).toLowerCase();
   if (!allowedExtensions.has(extension)) {
     throw new ApiError(415, "仅支持 PDF、DOCX、TXT、Markdown 文件");
   }
@@ -173,25 +181,27 @@ export async function searchChunks(
     parameters.push(`%"${options.tag}"%`);
   }
   const terms = queryTerms(query).slice(0, 4);
+  const lexicalClauses = [...clauses];
+  const lexicalParameters = [...parameters];
   if (terms.length) {
-    clauses.push(
+    lexicalClauses.push(
       `(${terms
         .map(() => "(c.content LIKE ? OR d.title LIKE ? OR d.tags LIKE ?)")
         .join(" OR ")})`,
     );
     for (const term of terms) {
-      parameters.push(`%${term}%`, `%${term}%`, `%${term}%`);
+      lexicalParameters.push(`%${term}%`, `%${term}%`, `%${term}%`);
     }
   }
-  const rows = await getDb()
+  const lexicalRows = await getDb()
     .prepare(
       `SELECT c.id AS chunk_id,c.chunk_index,c.content,
         d.id AS document_id,d.title,d.category,d.tags,d.updated_at
        FROM document_chunks c JOIN documents d ON d.id=c.document_id
-       ${join} WHERE ${clauses.join(" AND ")}`,
+       ${join} WHERE ${lexicalClauses.join(" AND ")}`,
     )
-    .all(...parameters) as SqlRow[];
-  return rows
+    .all(...lexicalParameters) as SqlRow[];
+  const lexicalHits = lexicalRows
     .map((row) => ({
       chunk_id: Number(row.chunk_id),
       chunk_index: Number(row.chunk_index),
@@ -210,6 +220,89 @@ export async function searchChunks(
       ),
     }))
     .filter((row) => row.score > 0)
-    .sort((left, right) => right.score - left.score)
-    .slice(0, options.limit ?? 12);
+    .sort((left, right) => right.score - left.score);
+  const limit = options.limit ?? 12;
+  if (!embeddingModelEnabled()) return lexicalHits.slice(0, limit);
+
+  try {
+    const queryVector = (await embedTexts([query]))[0];
+    if (!queryVector) return lexicalHits.slice(0, limit);
+    const semanticRows = (await getDb()
+      .prepare(
+        `SELECT c.id AS chunk_id,c.chunk_index,c.content,
+          d.id AS document_id,d.title,d.category,d.tags,d.updated_at,
+          e.embedding
+         FROM document_chunks c
+         JOIN documents d ON d.id=c.document_id
+         JOIN chunk_embeddings e ON e.chunk_id=c.id
+         ${join}
+         WHERE e.model=? AND ${clauses.join(" AND ")}
+         ORDER BY d.updated_at DESC,c.id DESC
+         LIMIT 5000`,
+      )
+      .all(embeddingModelName(), ...parameters)) as SqlRow[];
+    const semanticHits = semanticRows
+      .map((row): SearchHit | undefined => {
+        let vector: unknown;
+        try {
+          vector = JSON.parse(String(row.embedding));
+        } catch {
+          return undefined;
+        }
+        if (
+          !Array.isArray(vector) ||
+          !vector.every(
+            (value) => typeof value === "number" && Number.isFinite(value),
+          )
+        ) {
+          return undefined;
+        }
+        const semanticScore = cosineSimilarity(queryVector, vector);
+        if (semanticScore < embeddingMinimumScore()) return undefined;
+        const keywordScore = lexicalScore(
+          query,
+          String(row.content),
+          String(row.title),
+          String(row.tags),
+        );
+        return {
+          chunk_id: Number(row.chunk_id),
+          chunk_index: Number(row.chunk_index),
+          document_id: Number(row.document_id),
+          title: String(row.title),
+          category: String(row.category),
+          tags: tagsFromJson(row.tags),
+          content: String(row.content),
+          score: Number(
+            Math.min(1, semanticScore * 0.8 + keywordScore * 0.2).toFixed(4),
+          ),
+        };
+      })
+      .filter((row): row is SearchHit => Boolean(row));
+    if (!semanticHits.length) return lexicalHits.slice(0, limit);
+
+    const combined = new Map<number, SearchHit>(
+      semanticHits.map((row) => [row.chunk_id, row]),
+    );
+    for (const lexicalHit of lexicalHits) {
+      const existing = combined.get(lexicalHit.chunk_id);
+      if (existing) {
+        existing.score = Math.max(existing.score, lexicalHit.score);
+      } else {
+        combined.set(lexicalHit.chunk_id, {
+          ...lexicalHit,
+          score: Number((lexicalHit.score * 0.6).toFixed(4)),
+        });
+      }
+    }
+    return [...combined.values()]
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limit);
+  } catch (error) {
+    console.warn(
+      "Embedding search failed; using lexical fallback:",
+      error instanceof Error ? error.message : error,
+    );
+    return lexicalHits.slice(0, limit);
+  }
 }

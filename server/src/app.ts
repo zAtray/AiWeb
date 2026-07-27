@@ -38,11 +38,21 @@ import {
   nowIso,
   transaction,
 } from "./db.js";
-import { extractText } from "./documents.js";
+import {
+  extractText,
+  normalizeUploadFilename,
+} from "./documents.js";
+import {
+  embeddingModelEnabled,
+  embeddingModelName,
+  embeddingStats,
+  indexDocumentEmbeddings,
+} from "./embeddings.js";
 import {
   answerWithOllama,
   localModelEnabled,
   localModelName,
+  ollamaBaseUrl,
 } from "./ollama.js";
 import { extractiveAnswer, toCitations } from "./search.js";
 import {
@@ -77,6 +87,14 @@ export async function createApp() {
   app.get("/api/health", async (_request, response) => {
     const mysql = await databaseInfo();
     const modelEnabled = localModelEnabled();
+    const embeddingsEnabled = embeddingModelEnabled();
+    const embeddingIndex = embeddingsEnabled
+      ? await embeddingStats()
+      : null;
+    const modelServer = ollamaBaseUrl();
+    const remoteModelConfigured =
+      (modelEnabled || embeddingsEnabled) &&
+      !/^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/u.test(modelServer);
     response.json({
       status: "ok",
       app: "智知",
@@ -86,7 +104,13 @@ export async function createApp() {
       answer_engine: modelEnabled ? "local-qwen3-rag" : "local-extractive",
       local_model_configured: modelEnabled,
       local_model: modelEnabled ? localModelName() : null,
-      remote_model_configured: false,
+      retrieval_engine: embeddingsEnabled
+        ? "hybrid-vector-lexical"
+        : "lexical",
+      embedding_model_configured: embeddingsEnabled,
+      embedding_model: embeddingsEnabled ? embeddingModelName() : null,
+      embedding_index: embeddingIndex,
+      remote_model_configured: remoteModelConfigured,
     });
   });
 
@@ -397,8 +421,13 @@ export async function createApp() {
     async (request: AuthRequest, response) => {
       if (!request.file) throw new ApiError(400, "请选择上传文件");
       const user = userOf(request);
-      const originalName = path.basename(request.file.originalname);
-      const { storedPath, extension } = await persistUpload(request.file);
+      const originalName = path.basename(
+        normalizeUploadFilename(request.file.originalname),
+      );
+      const { storedPath, extension } = await persistUpload(
+        request.file,
+        originalName,
+      );
       try {
         const content = (await extractText(storedPath, extension)).trim();
         const title =
@@ -464,9 +493,26 @@ export async function createApp() {
         const row = (await getDb()
           .prepare(`${documentSelect} WHERE d.id=?`)
           .get(user.id, user.id, created.documentId)) as SqlRow;
+        let embeddedChunkCount = 0;
+        if (embeddingModelEnabled()) {
+          try {
+            embeddedChunkCount = await indexDocumentEmbeddings(
+              created.documentId,
+            );
+          } catch (error) {
+            console.warn(
+              "Document embedding failed; lexical search remains available:",
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }
         response
           .status(201)
-          .json({ ...documentJson(row), chunk_count: created.chunkCount });
+          .json({
+            ...documentJson(row),
+            chunk_count: created.chunkCount,
+            embedded_chunk_count: embeddedChunkCount,
+          });
       } catch (error) {
         await fsp.rm(storedPath, { force: true });
         throw error;
@@ -542,8 +588,13 @@ export async function createApp() {
       const id = numberId(request.params.id);
       const user = userOf(request);
       const current = await canAccessDocument(id, user, true);
-      const originalName = path.basename(request.file.originalname);
-      const { storedPath, extension } = await persistUpload(request.file);
+      const originalName = path.basename(
+        normalizeUploadFilename(request.file.originalname),
+      );
+      const { storedPath, extension } = await persistUpload(
+        request.file,
+        originalName,
+      );
       try {
         const content = (await extractText(storedPath, extension)).trim();
         const nextVersion = Number(current.version) + 1;
@@ -581,9 +632,25 @@ export async function createApp() {
             );
           return count;
         });
+        let embeddedChunkCount = 0;
+        if (embeddingModelEnabled()) {
+          try {
+            embeddedChunkCount = await indexDocumentEmbeddings(id);
+          } catch (error) {
+            console.warn(
+              "Document embedding failed; lexical search remains available:",
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }
         response
           .status(201)
-          .json({ ok: true, version: nextVersion, chunk_count: chunkCount });
+          .json({
+            ok: true,
+            version: nextVersion,
+            chunk_count: chunkCount,
+            embedded_chunk_count: embeddedChunkCount,
+          });
       } catch (error) {
         await fsp.rm(storedPath, { force: true });
         throw error;
