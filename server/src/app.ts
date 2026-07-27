@@ -33,6 +33,11 @@ import {
 } from "./core.js";
 import { getDb, nowIso, transaction } from "./db.js";
 import { extractText } from "./documents.js";
+import {
+  answerWithOllama,
+  localModelEnabled,
+  localModelName,
+} from "./ollama.js";
 import { extractiveAnswer, toCitations } from "./search.js";
 import {
   accessibleDocumentWhere,
@@ -63,10 +68,13 @@ export function createApp() {
   app.use(express.json({ limit: "1mb" }));
 
   app.get("/api/health", (_request, response) => {
+    const modelEnabled = localModelEnabled();
     response.json({
       status: "ok",
       app: "智知",
-      answer_engine: "local-extractive",
+      answer_engine: modelEnabled ? "local-qwen3-rag" : "local-extractive",
+      local_model_configured: modelEnabled,
+      local_model: modelEnabled ? localModelName() : null,
       remote_model_configured: false,
     });
   });
@@ -702,7 +710,7 @@ export function createApp() {
   app.post(
     "/api/chat/ask",
     requireUser,
-    (request: AuthRequest, response) => {
+    async (request: AuthRequest, response) => {
       const user = userOf(request);
       const question = text(request.body?.question, "问题", 2_000);
       const knowledgeBaseId = request.body?.knowledge_base_id
@@ -716,6 +724,21 @@ export function createApp() {
         knowledgeBaseId,
         limit: 5,
       });
+      const citations = toCitations(contexts);
+      let answer = extractiveAnswer(question, contexts);
+      let engine = "local-extractive";
+      if (localModelEnabled()) {
+        try {
+          answer = await answerWithOllama(question, contexts);
+          engine = "local-qwen3-rag";
+        } catch (error) {
+          engine = "local-extractive-fallback";
+          console.warn(
+            "Ollama answer failed; using extractive fallback:",
+            error instanceof Error ? error.message : error,
+          );
+        }
+      }
       const timestamp = nowIso();
       const sessionId = transaction(() => {
         let id = requestedSessionId;
@@ -742,8 +765,6 @@ export function createApp() {
             );
           id = Number(result.lastInsertRowid);
         }
-        const answer = extractiveAnswer(question, contexts);
-        const citations = toCitations(contexts);
         getDb()
           .prepare(
             `INSERT INTO messages(
@@ -771,9 +792,9 @@ export function createApp() {
       });
       response.json({
         session_id: sessionId,
-        answer: extractiveAnswer(question, contexts),
-        citations: toCitations(contexts),
-        engine: "local-extractive",
+        answer,
+        citations,
+        engine,
       });
     },
   );

@@ -9,3 +9,10 @@ data/*
 data/uploads/*
 !data/uploads/.gitkeep
 .env
+training/.venv/
+training/cache/
+training/output/
+training/tools/
+training/*.log
+training/__pycache__/
+training/**/*.pyc

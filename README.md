@@ -112,12 +112,30 @@ npm run test:stress
 - `seed.ts`：可重复演示数据
 - `stress.ts`：无额外工具依赖的并发压力测试
 
-## 后续接入家中台式机 Qwen
+## 可选本地 Qwen GPU 问答
 
-本版本按要求不实现远程连接代码。现有 `/api/chat/ask` 已把检索结果整理为统一
-上下文并保存会话、答案和引用；后续只需把 `server/src/search.ts` 中的
-`extractiveAnswer` 替换为一个独立的 Qwen 答案生成适配器，其余接口、数据库和
-Vue 页面不需要改动。
+`/api/chat/ask` 默认继续使用不依赖模型服务的 `local-extractive` 引擎。设置以下
+环境变量后，会把检索片段交给 Ollama 上的 Qwen3，并保存模型答案和对应引用；
+Ollama 超时或异常时会自动回退到抽取式回答。
+
+```powershell
+$env:LOCAL_LLM_ENABLED = "true"
+$env:OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+$env:OLLAMA_MODEL = "qwen3:8b"
+$env:OLLAMA_NUM_GPU = "99"
+$env:OLLAMA_NUM_CTX = "2048"
+$env:OLLAMA_KEEP_ALIVE = "10m"
+npm run dev
+```
+
+`OLLAMA_NUM_GPU=99` 会将包括输出层在内的模型放入 GPU。当前 RTX 3060 12GB
+使用 2048 上下文完成了连续 GPU 调用；更大的 4096 上下文在当前 Ollama
+0.31.2/CUDA 运行组合上出现过 runner 崩溃，因此不作为默认值。
+
+任务适配使用 `training/system-prompt-optimized.txt` 和
+`training/few-shot-optimized.json` 对应的规则与少样本消息。32 条留出题 GPU
+评测通过 31 条（96.88%），引用召回率 97.37%；完整结果见
+`training/output/few-shot-qwen3-8b-gpu-32.json`。
 
 最终部署建议：
 
