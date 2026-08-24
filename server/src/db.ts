@@ -120,8 +120,15 @@ CREATE TABLE IF NOT EXISTS document_chunks (
   document_id BIGINT UNSIGNED NOT NULL,
   chunk_index INT UNSIGNED NOT NULL,
   content LONGTEXT NOT NULL,
+  page_start INT UNSIGNED NULL,
+  page_end INT UNSIGNED NULL,
+  chapter VARCHAR(160) NULL,
+  section VARCHAR(220) NULL,
+  content_type VARCHAR(20) NOT NULL DEFAULT 'content',
+  quality_score DECIMAL(6,4) NOT NULL DEFAULT 1,
   UNIQUE KEY uq_document_chunks_document_index (document_id,chunk_index),
   KEY idx_chunks_document (document_id),
+  KEY idx_chunks_document_chapter (document_id,chapter),
   CONSTRAINT fk_document_chunks_document
     FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -157,6 +164,7 @@ CREATE TABLE IF NOT EXISTS messages (
   role ENUM('user','assistant') NOT NULL,
   content LONGTEXT NOT NULL,
   citations LONGTEXT NOT NULL,
+  retrieval_state LONGTEXT NULL,
   created_at VARCHAR(32) NOT NULL,
   KEY idx_messages_session (session_id),
   CONSTRAINT fk_messages_session
@@ -277,6 +285,41 @@ export async function initDb(): Promise<void> {
   if (initialized) return;
   ensureDirectories();
   await getPool().query(schema);
+  const [chunkColumns] = await getPool().query<RowDataPacket[]>(
+    "SHOW COLUMNS FROM document_chunks",
+  );
+  const existing = new Set(chunkColumns.map((row) => String(row.Field)));
+  const additions = [
+    ["page_start", "INT UNSIGNED NULL"],
+    ["page_end", "INT UNSIGNED NULL"],
+    ["chapter", "VARCHAR(160) NULL"],
+    ["section", "VARCHAR(220) NULL"],
+    ["content_type", "VARCHAR(20) NOT NULL DEFAULT 'content'"],
+    ["quality_score", "DECIMAL(6,4) NOT NULL DEFAULT 1"],
+  ] as const;
+  for (const [column, definition] of additions) {
+    if (!existing.has(column)) {
+      await getPool().query(
+        `ALTER TABLE document_chunks ADD COLUMN ${column} ${definition}`,
+      );
+    }
+  }
+  const [messageColumns] = await getPool().query<RowDataPacket[]>(
+    "SHOW COLUMNS FROM messages",
+  );
+  if (!messageColumns.some((row) => String(row.Field) === "retrieval_state")) {
+    await getPool().query(
+      "ALTER TABLE messages ADD COLUMN retrieval_state LONGTEXT NULL AFTER citations",
+    );
+  }
+  const [chunkIndexes] = await getPool().query<RowDataPacket[]>(
+    "SHOW INDEX FROM document_chunks WHERE Key_name='idx_chunks_document_chapter'",
+  );
+  if (!chunkIndexes.length) {
+    await getPool().query(
+      "ALTER TABLE document_chunks ADD KEY idx_chunks_document_chapter (document_id,chapter)",
+    );
+  }
   initialized = true;
 }
 
@@ -289,18 +332,24 @@ export function nowIso(): string {
 }
 
 export async function transaction<T>(work: () => Promise<T>): Promise<T> {
-  const connection = await getPool().getConnection();
-  try {
-    await connection.beginTransaction();
-    const result = await transactionContext.run(connection, work);
-    await connection.commit();
-    return result;
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    connection.release();
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const connection = await getPool().getConnection();
+    try {
+      await connection.beginTransaction();
+      const result = await transactionContext.run(connection, work);
+      await connection.commit();
+      return result;
+    } catch (error) {
+      await connection.rollback();
+      const code = (error as { code?: string }).code;
+      const retryable = code === "ER_LOCK_DEADLOCK" || code === "ER_LOCK_WAIT_TIMEOUT";
+      if (!retryable || attempt === 3) throw error;
+    } finally {
+      connection.release();
+    }
+    await new Promise((resolve) => setTimeout(resolve, attempt * 25));
   }
+  throw new Error("事务重试次数已耗尽");
 }
 
 export async function closeDb(): Promise<void> {

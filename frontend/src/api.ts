@@ -10,6 +10,18 @@ export function getToken(): string {
   return authToken;
 }
 
+export async function getProtectedFile(path: string): Promise<Blob> {
+  const response = await fetch(path, {
+    headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+  });
+  if (response.status === 401 && authToken) {
+    setToken("");
+    window.dispatchEvent(new Event("auth-expired"));
+  }
+  if (!response.ok) throw new Error("文件读取失败");
+  return response.blob();
+}
+
 export async function api<T>(
   path: string,
   options: RequestInit = {},
@@ -20,7 +32,8 @@ export async function api<T>(
     headers.set("Content-Type", "application/json");
   }
   const response = await fetch(path, { ...options, headers });
-  if (response.status === 401) {
+  // 登录接口的 401 表示凭据错误，不应被当成已有会话过期。
+  if (response.status === 401 && authToken && path !== "/api/auth/login") {
     setToken("");
     window.dispatchEvent(new Event("auth-expired"));
   }
@@ -38,11 +51,7 @@ export async function openProtectedFile(
   path: string,
   downloadName?: string,
 ): Promise<void> {
-  const response = await fetch(path, {
-    headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
-  });
-  if (!response.ok) throw new Error("文件读取失败");
-  const url = URL.createObjectURL(await response.blob());
+  const url = URL.createObjectURL(await getProtectedFile(path));
   if (downloadName) {
     const anchor = document.createElement("a");
     anchor.href = url;
@@ -53,4 +62,3 @@ export async function openProtectedFile(
   }
   window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
-

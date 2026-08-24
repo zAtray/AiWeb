@@ -9,7 +9,12 @@ import {
 } from "./config.js";
 import { ApiError, tagsFromJson } from "./core.js";
 import { getDb, nowIso } from "./db.js";
-import { chunkText } from "./documents.js";
+import {
+  chunkText,
+  structuredChunks,
+  type ExtractedDocument,
+  type StructuredChunk,
+} from "./documents.js";
 import {
   cosineSimilarity,
   embedTexts,
@@ -20,6 +25,7 @@ import {
 import { lexicalScore, queryTerms } from "./search.js";
 import type {
   AuthRequest,
+  SearchResult,
   SearchHit,
   SqlRow,
   User,
@@ -114,24 +120,61 @@ export const documentSelect = `
 
 export async function replaceChunks(
   documentId: number,
-  content: string,
+  source: string | ExtractedDocument,
+  replaceExisting = true,
 ): Promise<number> {
-  const chunks = chunkText(content);
+  let chunks: StructuredChunk[] = typeof source === "string"
+    ? chunkText(source).map((content) => ({
+        content,
+        pageStart: null,
+        pageEnd: null,
+        chapter: null,
+        section: null,
+        contentType: "content" as const,
+        qualityScore: 1,
+      }))
+    : structuredChunks(source);
+  if (!chunks.length && typeof source !== "string") {
+    chunks = chunkText(source.text).map((content) => ({
+      content,
+      pageStart: null,
+      pageEnd: null,
+      chapter: null,
+      section: null,
+      contentType: "content" as const,
+      qualityScore: 1,
+    }));
+  }
   if (!chunks.length) {
     throw new ApiError(
       400,
-      "文档中没有可提取的文字；扫描版 PDF 请先进行 OCR",
+      "文档中没有识别到可索引文字；请确认 PDF 清晰且没有损坏或加密",
     );
   }
   const db = getDb();
-  await db
-    .prepare("DELETE FROM document_chunks WHERE document_id=?")
-    .run(documentId);
+  if (replaceExisting) {
+    await db
+      .prepare("DELETE FROM document_chunks WHERE document_id=?")
+      .run(documentId);
+  }
   const insert = db.prepare(
-    "INSERT INTO document_chunks(document_id,chunk_index,content) VALUES (?,?,?)",
+    `INSERT INTO document_chunks(
+      document_id,chunk_index,content,page_start,page_end,chapter,section,
+      content_type,quality_score
+     ) VALUES (?,?,?,?,?,?,?,?,?)`,
   );
   for (const [index, chunk] of chunks.entries()) {
-    await insert.run(documentId, index, chunk);
+    await insert.run(
+      documentId,
+      index,
+      chunk.content,
+      chunk.pageStart,
+      chunk.pageEnd,
+      chunk.chapter,
+      chunk.section,
+      chunk.contentType,
+      chunk.qualityScore,
+    );
   }
   return chunks.length;
 }
@@ -157,11 +200,13 @@ export async function searchChunks(
   query: string,
   options: {
     knowledgeBaseId?: number;
+    documentIds?: number[];
+    chapter?: string;
     category?: string;
     tag?: string;
     limit?: number;
   } = {},
-): Promise<SearchHit[]> {
+): Promise<SearchResult> {
   const access = accessibleDocumentWhere(user);
   const clauses = [access.sql];
   const parameters: Array<string | number> = [...access.params];
@@ -171,6 +216,19 @@ export async function searchChunks(
     join = "JOIN kb_documents kd ON kd.document_id=d.id";
     clauses.push("kd.knowledge_base_id=?");
     parameters.push(options.knowledgeBaseId);
+  }
+  if (options.documentIds?.length) {
+    const documentIds = [...new Set(options.documentIds)].filter(
+      (id) => Number.isInteger(id) && id > 0,
+    );
+    if (documentIds.length) {
+      clauses.push(`d.id IN (${documentIds.map(() => "?").join(",")})`);
+      parameters.push(...documentIds);
+    }
+  }
+  if (options.chapter) {
+    clauses.push("c.chapter=?");
+    parameters.push(options.chapter);
   }
   if (options.category) {
     clauses.push("d.category=?");
@@ -195,7 +253,8 @@ export async function searchChunks(
   }
   const lexicalRows = await getDb()
     .prepare(
-      `SELECT c.id AS chunk_id,c.chunk_index,c.content,
+      `SELECT c.id AS chunk_id,c.chunk_index,c.content,c.page_start,c.page_end,
+        c.chapter,c.section,c.content_type,c.quality_score,
         d.id AS document_id,d.title,d.category,d.tags,d.updated_at
        FROM document_chunks c JOIN documents d ON d.id=c.document_id
        ${join} WHERE ${lexicalClauses.join(" AND ")}`,
@@ -210,7 +269,21 @@ export async function searchChunks(
       category: String(row.category),
       tags: tagsFromJson(row.tags),
       content: String(row.content),
+      page_start: row.page_start === null ? null : Number(row.page_start),
+      page_end: row.page_end === null ? null : Number(row.page_end),
+      chapter: row.chapter ? String(row.chapter) : null,
+      section: row.section ? String(row.section) : null,
+      content_type: String(row.content_type ?? "content") as SearchHit["content_type"],
+      quality_score: Number(row.quality_score ?? 1),
       score: Number(
+        lexicalScore(
+          query,
+          String(row.content),
+          String(row.title),
+          String(row.tags),
+        ).toFixed(4),
+      ),
+      lexical_score: Number(
         lexicalScore(
           query,
           String(row.content),
@@ -222,14 +295,34 @@ export async function searchChunks(
     .filter((row) => row.score > 0)
     .sort((left, right) => right.score - left.score);
   const limit = options.limit ?? 12;
-  if (!embeddingModelEnabled()) return lexicalHits.slice(0, limit);
+  if (!embeddingModelEnabled()) {
+    return { engine: "lexical", hits: lexicalHits.slice(0, limit) };
+  }
+
+  const indexedInScope = await getDb()
+    .prepare(
+      `SELECT 1 AS available
+       FROM document_chunks c
+       JOIN documents d ON d.id=c.document_id
+       JOIN chunk_embeddings e ON e.chunk_id=c.id
+       ${join}
+       WHERE e.model=? AND ${clauses.join(" AND ")}
+       LIMIT 1`,
+    )
+    .get(embeddingModelName(), ...parameters);
+  if (!indexedInScope) {
+    return { engine: "lexical", hits: lexicalHits.slice(0, limit) };
+  }
 
   try {
     const queryVector = (await embedTexts([query]))[0];
-    if (!queryVector) return lexicalHits.slice(0, limit);
+    if (!queryVector) {
+      return { engine: "lexical", hits: lexicalHits.slice(0, limit) };
+    }
     const semanticRows = (await getDb()
       .prepare(
-        `SELECT c.id AS chunk_id,c.chunk_index,c.content,
+        `SELECT c.id AS chunk_id,c.chunk_index,c.content,c.page_start,c.page_end,
+          c.chapter,c.section,c.content_type,c.quality_score,
           d.id AS document_id,d.title,d.category,d.tags,d.updated_at,
           e.embedding
          FROM document_chunks c
@@ -273,13 +366,23 @@ export async function searchChunks(
           category: String(row.category),
           tags: tagsFromJson(row.tags),
           content: String(row.content),
+          page_start: row.page_start === null ? null : Number(row.page_start),
+          page_end: row.page_end === null ? null : Number(row.page_end),
+          chapter: row.chapter ? String(row.chapter) : null,
+          section: row.section ? String(row.section) : null,
+          content_type: String(row.content_type ?? "content") as SearchHit["content_type"],
+          quality_score: Number(row.quality_score ?? 1),
+          lexical_score: Number(keywordScore.toFixed(4)),
+          semantic_score: Number(semanticScore.toFixed(4)),
           score: Number(
             Math.min(1, semanticScore * 0.8 + keywordScore * 0.2).toFixed(4),
           ),
         };
       })
       .filter((row): row is SearchHit => Boolean(row));
-    if (!semanticHits.length) return lexicalHits.slice(0, limit);
+    if (!semanticHits.length) {
+      return { engine: "lexical", hits: lexicalHits.slice(0, limit) };
+    }
 
     const combined = new Map<number, SearchHit>(
       semanticHits.map((row) => [row.chunk_id, row]),
@@ -295,14 +398,17 @@ export async function searchChunks(
         });
       }
     }
-    return [...combined.values()]
-      .sort((left, right) => right.score - left.score)
-      .slice(0, limit);
+    return {
+      engine: "hybrid-vector-lexical",
+      hits: [...combined.values()]
+        .sort((left, right) => right.score - left.score)
+        .slice(0, limit),
+    };
   } catch (error) {
     console.warn(
       "Embedding search failed; using lexical fallback:",
       error instanceof Error ? error.message : error,
     );
-    return lexicalHits.slice(0, limit);
+    return { engine: "lexical", hits: lexicalHits.slice(0, limit) };
   }
 }

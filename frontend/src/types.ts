@@ -6,6 +6,7 @@ export type ViewName =
   | "search"
   | "chat"
   | "shared"
+  | "profile"
   | "admin";
 
 export interface User {
@@ -50,6 +51,7 @@ export interface DocumentItem {
   favorite_count: number;
   comment_count: number;
   knowledge_base_count: number;
+  content?: string;
   created_at: string;
   updated_at: string;
   knowledge_bases?: Array<{ id: number; name: string }>;
@@ -71,6 +73,12 @@ export interface SearchHit {
   tags: string[];
   content: string;
   score: number;
+  page_start: number | null;
+  page_end: number | null;
+  chapter: string | null;
+  section: string | null;
+  content_type: "content" | "heading" | "toc";
+  quality_score: number;
 }
 
 export interface Citation {
@@ -78,6 +86,12 @@ export interface Citation {
   title: string;
   content: string;
   score: number;
+  chunk_id: number;
+  chunk_index: number;
+  page_start: number | null;
+  page_end: number | null;
+  chapter: string | null;
+  section: string | null;
 }
 
 export interface ChatMessage {
@@ -95,6 +109,67 @@ export interface ChatSession {
   knowledge_base_name: string | null;
   message_count: number;
   updated_at: string;
+}
+
+export interface ModelConnectionStatus {
+  status: "disabled" | "connected" | "model_missing" | "offline";
+  configured: boolean;
+  connected: boolean;
+  model: string | null;
+  model_available: boolean;
+  latency_ms: number | null;
+  answer_model: {
+    configured: boolean;
+    name: string | null;
+    available: boolean;
+  };
+  embedding_model: {
+    configured: boolean;
+    name: string | null;
+    available: boolean;
+  };
+  embedding_index: {
+    chunks: number;
+    indexed: number;
+    pending: number;
+  } | null;
+}
+
+export interface AppConfig {
+  upload: {
+    max_mb: number;
+    allowed_extensions: string[];
+    pdf_ocr_enabled: boolean;
+    pdf_ocr_max_pages: number;
+  };
+}
+
+export type RetrievalEngine = "lexical" | "hybrid-vector-lexical";
+
+export interface SearchResponse {
+  query: string;
+  mode: "fulltext";
+  retrieval_engine: RetrievalEngine;
+  results: SearchHit[];
+}
+
+export interface ChatResponse {
+  session_id: number;
+  answer: string;
+  citations: Citation[];
+  engine:
+    | "local-qwen3-rag"
+    | "local-extractive-fallback"
+    | "local-extractive"
+    | "local-qwen3-refinement"
+    | "local-refinement-fallback"
+    | "local-platform-query";
+  retrieval_engine: RetrievalEngine | "none";
+  intent: "new_query" | "refinement" | "contextual_query" | "overview";
+  retrieval_performed: boolean;
+  query_type: "local" | "overview";
+  scope_document_ids: number[];
+  scope_source: "query" | "history" | "dominant" | "knowledge_base" | "none";
 }
 
 export interface CommentItem {
@@ -129,4 +204,3 @@ export interface DashboardStats {
     created_at: string;
   }>;
 }
-

@@ -1,18 +1,34 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# Dependencies and build output
 node_modules/
 frontend/dist/
 server/dist/
+*.tsbuildinfo
+
+# Runtime state and business data
+data/
+output/
+runtime/
+*.pid
+*.log
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Machine-specific native launchers (the portable entrypoint is start-docker.ps1)
+start-local.ps1
+stop-local.ps1
+start.ps1
+
+# Test and coverage artifacts
 coverage/
-data/*
-!data/seed-report.json
-!data/stress-report.json
-!data/uploads/
-data/uploads/*
-!data/uploads/.gitkeep
-.env
-training/.venv/
-training/cache/
-training/output/
-training/tools/
-training/*.log
-training/__pycache__/
-training/**/*.pyc
+test-results/
+playwright-report/

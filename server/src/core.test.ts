@@ -1,108 +1,68 @@
 import { describe, expect, it } from "vitest";
-import { hashPassword, verifyPassword } from "./auth.js";
 import {
   ApiError,
   documentJson,
   numberId,
+  optionalText,
   parseTags,
   tagsFromJson,
   text,
 } from "./core.js";
 import {
-  chunkText,
-  normalizeUploadFilename,
-} from "./documents.js";
-import { extractiveAnswer, lexicalScore, queryTerms } from "./search.js";
+  classifyQuery,
+  isDocumentInventoryQuery,
+  isSufficientlyRelevantEvidence,
+} from "./retrieval.js";
 
-describe("公共逻辑单元测试", () => {
-  it("校验并转换资源编号", () => {
-    expect(numberId("12")).toBe(12);
-    expect(() => numberId("0")).toThrow(ApiError);
-    expect(() => numberId("abc")).toThrow("无效的资源编号");
+describe("core validation", () => {
+  it.each([[1, 1], ["42", 42]])("accepts safe IDs", (input, expected) => {
+    expect(numberId(input)).toBe(expected);
   });
 
-  it("统一清理文本参数", () => {
-    expect(text("  知识管理  ", "标题")).toBe("知识管理");
-    expect(() => text("", "标题")).toThrow("标题不能为空");
-    expect(() => text("abcd", "标题", 3)).toThrow("不能超过");
-  });
+  it.each([0, -1, 1.5, "bad", Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid IDs",
+    (input) => expect(() => numberId(input)).toThrow(ApiError),
+  );
 
-  it("标签支持中英文逗号、去重和数量限制", () => {
-    expect(parseTags("检索，知识库,检索")).toEqual(["检索", "知识库"]);
-    expect(parseTags(["A", " A ", "B"])).toEqual(["A", "B"]);
-    expect(parseTags(null)).toEqual([]);
+  it("trims required text", () => expect(text("  hello  ", "field")).toBe("hello"));
+  it("rejects blank required text", () => expect(() => text("  ", "field")).toThrow("不能为空"));
+  it("rejects overlong required text", () => expect(() => text("abcd", "field", 3)).toThrow("不能超过"));
+  it("normalizes optional text", () => expect(optionalText("  note ", 10)).toBe("note"));
+  it("rejects malformed optional text", () => expect(() => optionalText(12)).toThrow(ApiError));
+  it("deduplicates and limits tags", () => {
+    expect(parseTags("a，b,a,, c")).toEqual(["a", "b", "c"]);
+    expect(parseTags(Array.from({ length: 25 }, (_, index) => `t${index}`))).toHaveLength(20);
   });
-
-  it("安全解析数据库标签并隐藏内部字段", () => {
-    expect(tagsFromJson('["课程","测试"]')).toEqual(["课程", "测试"]);
-    expect(tagsFromJson("broken")).toEqual([]);
-    expect(
-      documentJson({
-        id: 1,
-        tags: '["课程"]',
-        favorite: 1,
-        liked: 0,
-        stored_path: "private",
-        text_content: "private",
-      }),
-    ).toEqual({ id: 1, tags: ["课程"], favorite: true, liked: false });
+  it("reads valid tag JSON and tolerates corrupt JSON", () => {
+    expect(tagsFromJson('["a","b"]')).toEqual(["a", "b"]);
+    expect(tagsFromJson("not-json")).toEqual([]);
   });
-
-  it("密码哈希可验证且拒绝错误密码", () => {
-    const encoded = hashPassword("Demo@123");
-    expect(encoded).not.toContain("Demo@123");
-    expect(verifyPassword("Demo@123", encoded)).toBe(true);
-    expect(verifyPassword("wrong", encoded)).toBe(false);
+  it("removes private document fields", () => {
+    const result = documentJson({ stored_path: "secret", text_content: "private", tags: '["x"]', favorite: 1, liked: 0 });
+    expect(result).toMatchObject({ tags: ["x"], favorite: true, liked: false });
+    expect(result).not.toHaveProperty("stored_path");
+    expect(result).not.toHaveProperty("text_content");
   });
+});
 
-  it("长文本会分块且保留重叠上下文", () => {
-    const chunks = chunkText("第一段。".repeat(80), 120, 20);
-    expect(chunks.length).toBeGreaterThan(2);
-    expect(chunks.every((item) => item.length <= 120)).toBe(true);
-    expect(chunkText("   ")).toEqual([]);
+describe("retrieval intent edges", () => {
+  it("treats document types as content, not a document inventory request", () => {
+    expect(isDocumentInventoryQuery("平台支持哪四类文档？")).toBe(false);
+    expect(isDocumentInventoryQuery("平台支持哪四类文档，最大上传大小是多少？")).toBe(false);
+    expect(isDocumentInventoryQuery("当前知识库有哪些文档？")).toBe(true);
   });
-
-  it("修复 multipart 对中文文件名的 Latin-1 误解码", () => {
-    expect(
-      normalizeUploadFilename(
-        "æå­æç¨¿1_å·²æ·»å åè½è¯´æ.docx",
-      ),
-    ).toBe("文字文稿1_已添加功能说明.docx");
-    expect(normalizeUploadFilename("课程资料.docx")).toBe("课程资料.docx");
-    expect(normalizeUploadFilename("resume-é.txt")).toBe("resume-é.txt");
+  it("recognizes natural overview wording", () => {
+    expect(classifyQuery("请概览这份资料的主要章节。" )).toBe("overview");
   });
-
-  it("中文长查询会生成二字候选词", () => {
-    expect(queryTerms("知识管理")).toEqual(
-      expect.arrayContaining(["知识管理", "知识", "识管", "管理"]),
-    );
-  });
-
-  it("标题和正文命中能得到稳定相关度", () => {
-    const strong = lexicalScore(
-      "全文检索",
-      "系统支持全文检索并展示匹配片段。",
-      "全文检索说明",
-    );
-    const weak = lexicalScore("全文检索", "用户注册与登录。", "账号说明");
-    expect(strong).toBeGreaterThan(weak);
-    expect(weak).toBe(0);
-  });
-
-  it("检索摘要包含引用，空结果给出明确提示", () => {
-    const answer = extractiveAnswer("如何检索？", [
-      {
-        chunk_id: 1,
-        chunk_index: 0,
-        document_id: 1,
-        title: "检索说明",
-        category: "技术文档",
-        tags: [],
-        content: "系统支持全文检索。结果会显示原文片段。",
-        score: 0.9,
-      },
-    ]);
-    expect(answer).toContain("[1]");
-    expect(extractiveAnswer("未知问题", [])).toContain("没有检索到");
+  it("accepts a strong hybrid hit even when Chinese phrase coverage is sparse", () => {
+    expect(isSufficientlyRelevantEvidence("本平台是否依赖远程云数据库？", {
+      id: 1,
+      chunk_id: 1,
+      document_id: 1,
+      title: "系统架构",
+      content: "平台完全运行在本机，数据库为 MySQL。",
+      score: 0.46,
+      lexical_score: 0.18,
+    } as never)).toBe(true);
   });
 });

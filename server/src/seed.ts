@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { hashPassword } from "./auth.js";
 import { dataDirectory, uploadDirectory } from "./config.js";
-import { getDb, initDb, nowIso, transaction } from "./db.js";
+import { closeDb, getDb, initDb, nowIso, transaction } from "./db.js";
 
 type Profile = "small" | "medium" | "large";
 
@@ -46,6 +46,16 @@ const profileName = (process.env.DEMO_SCALE ?? "medium") as Profile;
 const profile = profiles[profileName];
 if (!profile) {
   throw new Error("DEMO_SCALE 仅支持 small、medium、large");
+}
+const demoPrefix = (process.env.DEMO_PREFIX ?? "demo").trim().toLowerCase();
+if (!/^[a-z][a-z0-9-]{0,19}$/u.test(demoPrefix)) {
+  throw new Error("DEMO_PREFIX 仅支持 1-20 位小写字母、数字和连字符，且必须以字母开头");
+}
+const usernamePrefix = demoPrefix.replaceAll("-", "_");
+const searchLogMode = demoPrefix === "demo" ? "demo" : `demo:${demoPrefix}`;
+const reportFileName = process.env.DEMO_REPORT_FILE?.trim() || "seed-report.json";
+if (path.basename(reportFileName) !== reportFileName || !reportFileName.endsWith(".json")) {
+  throw new Error("DEMO_REPORT_FILE 必须是 data 目录下的 JSON 文件名");
 }
 
 let randomState = Number(process.env.DEMO_SEED ?? 20260725) >>> 0;
@@ -96,7 +106,7 @@ async function removeOldDemoFiles(): Promise<void> {
   const names = await fs.readdir(uploadDirectory).catch(() => []);
   await Promise.all(
     names
-      .filter((name) => name.startsWith("demo-"))
+      .filter((name) => name.startsWith(`${demoPrefix}-`))
       .map((name) => fs.rm(path.join(uploadDirectory, name), { force: true })),
   );
 }
@@ -113,8 +123,10 @@ async function main(): Promise<void> {
   const documentIds: number[] = [];
 
   await transaction(async () => {
-    await db.prepare("DELETE FROM search_logs WHERE mode='demo'").run();
-    await db.prepare("DELETE FROM users WHERE username LIKE 'demo_%'").run();
+    await db.prepare("DELETE FROM search_logs WHERE mode=?").run(searchLogMode);
+    await db
+      .prepare("DELETE FROM users WHERE LEFT(username,?)=?")
+      .run(usernamePrefix.length + 1, `${usernamePrefix}_`);
 
     const insertUser = db.prepare(
       `INSERT INTO users(username,email,password_hash,role,created_at)
@@ -122,8 +134,8 @@ async function main(): Promise<void> {
     );
     for (let index = 1; index <= profile.users; index += 1) {
       const result = await insertUser.run(
-        `demo_${String(index).padStart(3, "0")}`,
-        `demo${index}@example.test`,
+        `${usernamePrefix}_${String(index).padStart(3, "0")}`,
+        `${usernamePrefix}${index}@example.test`,
         passwordHash,
         index <= 3 ? "department_admin" : "user",
         randomDate(),
@@ -157,7 +169,7 @@ async function main(): Promise<void> {
     const content = documentText(index, category, topic);
     const storedPath = path.join(
       uploadDirectory,
-      `demo-${String(index).padStart(4, "0")}.txt`,
+      `${demoPrefix}-${String(index).padStart(4, "0")}.txt`,
     );
     return { index, category, topic, content, storedPath };
   });
@@ -266,10 +278,15 @@ async function main(): Promise<void> {
 
     const insertLog = db.prepare(
       `INSERT INTO search_logs(user_id,query,mode,created_at)
-       VALUES (?,?,'demo',?)`,
+       VALUES (?,?,?,?)`,
     );
     for (let index = 0; index < profile.searchLogs; index += 1) {
-      await insertLog.run(pick(userIds), pick(topics), randomDate(30));
+      await insertLog.run(
+        pick(userIds),
+        pick(topics),
+        searchLogMode,
+        randomDate(30),
+      );
     }
 
     const insertSession = db.prepare(
@@ -338,16 +355,24 @@ async function main(): Promise<void> {
   const counts = Object.fromEntries(countEntries);
   const report = {
     profile: profileName,
+    demo_prefix: demoPrefix,
     generated_at: nowIso(),
     elapsed_ms: Math.round(performance.now() - startedAt),
-    demo_login: { account: "demo_001", password: "Demo@123" },
+    demo_login: {
+      account: `${usernamePrefix}_001`,
+      password: "Demo@123",
+    },
     counts,
   };
   await fs.writeFile(
-    path.join(dataDirectory, "seed-report.json"),
+    path.join(dataDirectory, reportFileName),
     JSON.stringify(report, null, 2),
   );
   console.log(JSON.stringify(report, null, 2));
 }
 
-await main();
+try {
+  await main();
+} finally {
+  await closeDb();
+}

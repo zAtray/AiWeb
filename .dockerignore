@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.env.*
+node_modules
+frontend/dist
+server/dist
+data
+output
+runtime
+coverage
+test-results
+playwright-report
+*.log
+*.pid
+README.md
+

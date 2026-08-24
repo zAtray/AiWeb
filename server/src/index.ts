@@ -1,13 +1,12 @@
 import { createApp } from "./app.js";
-import { port } from "./config.js";
+import { port, uploadRequestTimeoutMs } from "./config.js";
 import {
   backfillMissingEmbeddings,
   embeddingModelEnabled,
 } from "./embeddings.js";
 
 const app = await createApp();
-
-app.listen(port, "0.0.0.0", () => {
+const server = app.listen(port, "0.0.0.0", () => {
   console.log(`智知平台已启动：http://127.0.0.1:${port}`);
   if (embeddingModelEnabled()) {
     void backfillMissingEmbeddings()
@@ -22,3 +21,7 @@ app.listen(port, "0.0.0.0", () => {
       });
   }
 });
+
+// Tailscale relay links can be slower than a LAN. Keep enough time for the
+// request body to arrive; document embeddings are queued after the response.
+server.requestTimeout = uploadRequestTimeoutMs;
