@@ -3,6 +3,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $environmentFile = Join-Path $projectRoot ".env.docker"
 $templateFile = Join-Path $projectRoot ".env.docker.example"
+$script:appPort = 8000
 
 function New-HexSecret([int]$Bytes = 24) {
   $buffer = New-Object byte[] $Bytes
@@ -18,7 +19,7 @@ function New-HexSecret([int]$Bytes = 24) {
 function Test-AiWebHealth {
   try {
     $request = [Net.HttpWebRequest]::Create(
-      "http://127.0.0.1:8000/api/health"
+      "http://127.0.0.1:$script:appPort/api/health"
     )
     $request.Method = "GET"
     $request.Timeout = 5000
@@ -69,6 +70,16 @@ if (-not (Test-Path -LiteralPath $environmentFile)) {
   Write-Host "已生成仅供本机使用的 .env.docker（不会提交到 GitHub）。"
 }
 
+$configuredPort = Get-Content -LiteralPath $environmentFile -Encoding UTF8 |
+  Where-Object { $_ -match '^APP_PORT=(\d+)$' } |
+  Select-Object -First 1
+if ($configuredPort -and $configuredPort -match '^APP_PORT=(\d+)$') {
+  $script:appPort = [int]$matches[1]
+}
+if ($script:appPort -lt 1 -or $script:appPort -gt 65535) {
+  throw ".env.docker 中 APP_PORT 必须是 1 到 65535 的端口号。"
+}
+
 Push-Location $projectRoot
 try {
   Write-Host "正在构建并启动 AiWeb。首次运行会下载 MySQL、Ollama 和约数 GB 的模型。"
@@ -79,7 +90,7 @@ try {
   $nextStatus = [DateTime]::UtcNow
   while ([DateTime]::UtcNow -lt $deadline) {
     if (Test-AiWebHealth) {
-      Write-Host "AiWeb 已启动：http://127.0.0.1:8000"
+      Write-Host "AiWeb 已启动：http://127.0.0.1:$script:appPort"
       Write-Host "初始管理员账号：admin；密码位于 .env.docker 的 ADMIN_PASSWORD。"
       exit 0
     }
