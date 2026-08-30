@@ -14,7 +14,6 @@ import ChatView from "./views/ChatView.vue";
 import DashboardView from "./views/DashboardView.vue";
 import DocumentsView from "./views/DocumentsView.vue";
 import KnowledgeView from "./views/KnowledgeView.vue";
-import ProfileView from "./views/ProfileView.vue";
 import SearchView from "./views/SearchView.vue";
 import SharedView from "./views/SharedView.vue";
 
@@ -45,7 +44,6 @@ onBeforeUnmount(w.dispose);
       <SearchView v-else-if="w.activeView.value === 'search'" />
       <ChatView v-else-if="w.activeView.value === 'chat'" />
       <SharedView v-else-if="w.activeView.value === 'shared'" />
-      <ProfileView v-else-if="w.activeView.value === 'profile'" />
       <AdminView v-else-if="w.activeView.value === 'admin'" />
     </main>
 

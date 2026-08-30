@@ -15,7 +15,7 @@ const w = requireWorkspace(inject(workspaceKey));
       <div class="story-metrics">
         <span><b>4</b> 类文档</span>
         <span><b>3</b> 级权限</span>
-        <span><b>100%</b> 本地数据</span>
+        <span><b>云端</b> AI 增强</span>
       </div>
     </section>
     <main class="auth-panel">

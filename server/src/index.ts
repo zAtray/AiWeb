@@ -1,24 +1,23 @@
 import { createApp } from "./app.js";
-import { port, uploadRequestTimeoutMs } from "./config.js";
 import {
-  backfillMissingEmbeddings,
+  assertAcceptanceDatabaseSafety,
+  host,
+  port,
+  uploadRequestTimeoutMs,
+} from "./config.js";
+import {
   embeddingModelEnabled,
 } from "./embeddings.js";
+import { queueMissingEmbeddings } from "./embedding-queue.js";
 
+// This must run before createApp(), because createApp() initializes the schema
+// and may seed the administrator account.
+assertAcceptanceDatabaseSafety();
 const app = await createApp();
-const server = app.listen(port, "0.0.0.0", () => {
+const server = app.listen(port, host, () => {
   console.log(`智知平台已启动：http://127.0.0.1:${port}`);
   if (embeddingModelEnabled()) {
-    void backfillMissingEmbeddings()
-      .then((count) => {
-        console.log(`向量索引已同步：新增 ${count} 个文档片段`);
-      })
-      .catch((error: unknown) => {
-        console.warn(
-          "向量索引同步失败；全文检索仍可用：",
-          error instanceof Error ? error.message : error,
-        );
-      });
+    queueMissingEmbeddings();
   }
 });
 

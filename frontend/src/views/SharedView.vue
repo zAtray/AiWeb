@@ -7,8 +7,18 @@ const w = requireWorkspace(inject(workspaceKey));
 
 <template>
   <div class="page">
-    <section class="split-head">
+    <section class="split-head shared-head">
       <div><p class="eyebrow">KNOWLEDGE COMMONS</p><h3>知识广场</h3><p>查看已通过审核的热门知识与最新发布内容。</p></div>
+      <div class="shared-sort" aria-label="共享文档排序方式">
+        <button
+          :class="{ active: w.sharedSort.value === 'hot' }"
+          @click="w.sharedSort.value = 'hot'; w.loadDocuments('shared')"
+        >热门</button>
+        <button
+          :class="{ active: w.sharedSort.value === 'latest' }"
+          @click="w.sharedSort.value = 'latest'; w.loadDocuments('shared')"
+        >最新</button>
+      </div>
     </section>
     <section class="shared-grid">
       <article v-for="item in w.sharedDocuments.value" :key="item.id">

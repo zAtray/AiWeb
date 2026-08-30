@@ -19,7 +19,7 @@ if (!documentIds.length) {
   throw new Error("必须使用 --ids=203,204 明确指定文档，脚本不会默认处理全部数据");
 }
 if (!embeddingModelEnabled()) {
-  throw new Error("EMBEDDING_ENABLED 未启用，拒绝生成空索引");
+  throw new Error("Embedding API 配置不完整，拒绝生成空索引");
 }
 
 await initDb();

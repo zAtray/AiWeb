@@ -4,9 +4,35 @@ export class ApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly code?: string,
   ) {
     super(message);
   }
+}
+
+export function strictEnum<T extends string>(
+  value: unknown,
+  name: string,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  if (value == null || value === "") return fallback;
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    throw new ApiError(400, `${name} 参数无效`);
+  }
+  return value as T;
+}
+
+export function strictLimit(value: unknown, fallback = 12, maximum = 50): number {
+  if (value == null || value === "") return fallback;
+  if (typeof value !== "string" || !/^\d+$/u.test(value)) {
+    throw new ApiError(400, "limit 参数无效");
+  }
+  const limit = Number(value);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > maximum) {
+    throw new ApiError(400, `limit 必须在 1-${maximum} 之间`);
+  }
+  return limit;
 }
 
 export function numberId(value: unknown): number {
@@ -67,4 +93,3 @@ export function documentJson(row: SqlRow): SqlRow {
   delete item.text_content;
   return item;
 }
-

@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { resolveStoredPath } from "./config.js";
 import { closeDb, getDb, initDb, transaction } from "./db.js";
 import { chunkText, extractDocument, structuredChunks } from "./documents.js";
 import { embeddingModelEnabled, indexDocumentEmbeddings } from "./embeddings.js";
@@ -38,7 +39,7 @@ try {
       )
       .get(documentId)) as SqlRow | undefined;
     if (!document) throw new Error(`文档 ${documentId} 不存在`);
-    const storedPath = path.resolve(String(document.stored_path));
+    const storedPath = resolveStoredPath(String(document.stored_path));
     await fs.access(storedPath);
     const extension = path.extname(storedPath).toLowerCase();
     if (extension !== ".pdf") {

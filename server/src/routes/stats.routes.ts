@@ -27,15 +27,6 @@ export function createStatsRouter(): Router {
         )
         .get(...(admin ? [] : [user.id]))
     )!.count;
-    const questions = (
-      await getDb()
-        .prepare(
-          `SELECT COUNT(*) AS count FROM messages m
-           JOIN chat_sessions s ON s.id=m.session_id
-           WHERE s.user_id=? AND m.role='user'`,
-        )
-        .get(user.id)
-    )!.count;
     const searches = (
       await getDb()
         .prepare("SELECT COUNT(*) AS count FROM search_logs WHERE user_id=?")
@@ -64,19 +55,17 @@ export function createStatsRouter(): Router {
     ).reverse();
     const popularDocuments = await getDb()
       .prepare(
-        `SELECT d.id,d.title,d.views,d.downloads,
-           (SELECT COUNT(*) FROM likes l WHERE l.document_id=d.id) AS likes
+        `SELECT d.id,d.title,d.category,d.created_at,d.views,d.downloads,
+          (d.views+d.downloads*2+(SELECT COUNT(*)*3 FROM likes l WHERE l.document_id=d.id)) AS popularity
          FROM documents d WHERE ${access.sql}
-         ORDER BY (
-           d.views+d.downloads*2+
-           (SELECT COUNT(*)*3 FROM likes l WHERE l.document_id=d.id)
-         ) DESC LIMIT 6`,
+         ORDER BY popularity DESC,d.updated_at DESC LIMIT 8`,
       )
       .all(...access.params);
     const latestDocuments = await getDb()
       .prepare(
-        `SELECT d.id,d.title,d.category,d.created_at FROM documents d
-         WHERE ${access.sql} ORDER BY d.created_at DESC LIMIT 6`,
+        `SELECT d.id,d.title,d.category,d.created_at,d.views,d.downloads
+         FROM documents d WHERE ${access.sql}
+         ORDER BY d.created_at DESC,d.id DESC LIMIT 8`,
       )
       .all(...access.params);
     response.json({
@@ -84,13 +73,12 @@ export function createStatsRouter(): Router {
       knowledge_bases: Number(knowledgeBases),
       views: Number(totals.views),
       downloads: Number(totals.downloads),
-      questions: Number(questions),
       searches: Number(searches),
       categories,
       hot_keywords: hotKeywords,
       search_trend: searchTrend,
-      popular_documents: popularDocuments,
-      latest_documents: latestDocuments,
+      popularDocuments,
+      latestDocuments,
     });
   });
   return router;

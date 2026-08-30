@@ -3,14 +3,15 @@ import path from "node:path";
 import { Router } from "express";
 import multer from "multer";
 import { requireUser } from "../auth.js";
-import { maxUploadBytes } from "../config.js";
+import { maxUploadBytes, resolveStoredPath } from "../config.js";
 import {
   ApiError,
   documentJson,
   numberId,
   optionalText,
   parseTags,
-  tagsFromJson,
+  strictEnum,
+  strictLimit,
 } from "../core.js";
 import { getDb, nowIso, transaction } from "../db.js";
 import { extractDocument, normalizeUploadFilename } from "../documents.js";
@@ -22,6 +23,7 @@ import {
   documentSelect,
   persistUpload,
   replaceChunks,
+  syncRagSearchDocument,
   userOf,
 } from "../services.js";
 import type { AuthRequest, SqlRow } from "../types.js";
@@ -33,6 +35,15 @@ const upload = multer({
   // maximum remains valid while the first byte over the limit is rejected.
   limits: { fileSize: maxUploadBytes + 1 },
 });
+
+async function extractUploadedDocument(storedPath: string, extension: string) {
+  try {
+    return await extractDocument(storedPath, extension);
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(422, "文档解析失败，请确认文件没有损坏或加密");
+  }
+}
 
 export function createDocumentsRouter(): Router {
   const router = Router();
@@ -50,8 +61,9 @@ export function createDocumentsRouter(): Router {
     const knowledgeBaseId = request.query.knowledge_base_id
       ? numberId(request.query.knowledge_base_id)
       : undefined;
-    const scope = String(request.query.scope ?? "all");
-    const sort = String(request.query.sort ?? "updated");
+    const scope = strictEnum(request.query.scope, "scope", ["all", "mine", "favorites", "shared"] as const, "all");
+    const sort = strictEnum(request.query.sort, "sort", ["updated", "latest", "hot"] as const, "updated");
+    const limit = strictLimit(request.query.limit, 50, 100);
     if (category) {
       clauses.push("d.category=?");
       parameters.push(category);
@@ -85,7 +97,7 @@ export function createDocumentsRouter(): Router {
     const rows = (await getDb()
       .prepare(
         `${documentSelect} ${join}
-         WHERE ${clauses.join(" AND ")} ORDER BY ${order}`,
+         WHERE ${clauses.join(" AND ")} ORDER BY ${order} LIMIT ${limit}`,
       )
       .all(user.id, user.id, ...parameters)) as SqlRow[];
     response.json(rows.map(documentJson));
@@ -97,9 +109,12 @@ export function createDocumentsRouter(): Router {
     const originalName = path.basename(
       normalizeUploadFilename(request.file.originalname),
     );
-    const { storedPath, extension } = await persistUpload(request.file, originalName);
+    const { storedPath, filePath, extension } = await persistUpload(
+      request.file,
+      originalName,
+    );
     try {
-      const extracted = await extractDocument(storedPath, extension);
+      const extracted = await extractUploadedDocument(filePath, extension);
       const content = extracted.text.trim();
       const title =
         optionalText(request.body?.title, 150) || path.basename(originalName, extension);
@@ -164,7 +179,7 @@ export function createDocumentsRouter(): Router {
         embedding_queued: queueDocumentEmbedding(created.documentId),
       });
     } catch (error) {
-      await fsp.rm(storedPath, { force: true });
+      await fsp.rm(filePath, { force: true });
       throw error;
     }
   });
@@ -181,9 +196,18 @@ export function createDocumentsRouter(): Router {
       .prepare(
         `SELECT k.id,k.name FROM knowledge_bases k
          JOIN kb_documents kd ON kd.knowledge_base_id=k.id
-         WHERE kd.document_id=? ORDER BY k.name`,
+         WHERE kd.document_id=?
+         ${["department_admin", "system_admin"].includes(user.role)
+           ? ""
+           : "AND (k.owner_id=? OR k.visibility IN ('shared','public'))"}
+         ORDER BY k.name`,
       )
-      .all(id);
+      .all(
+        id,
+        ...(["department_admin", "system_admin"].includes(user.role)
+          ? []
+          : [user.id]),
+      );
     const versions = await getDb()
       .prepare(
         `SELECT id,version,filename,file_size,created_at
@@ -206,11 +230,14 @@ export function createDocumentsRouter(): Router {
     if (!title) throw new ApiError(400, "文档标题不能为空");
     const category = optionalText(request.body?.category, 50) || "未分类";
     const tags = parseTags(request.body?.tags);
-    await getDb()
-      .prepare(
-        `UPDATE documents SET title=?,category=?,tags=?,updated_at=? WHERE id=?`,
-      )
-      .run(title, category, JSON.stringify(tags), nowIso(), id);
+    await transaction(async () => {
+      await getDb()
+        .prepare(
+          `UPDATE documents SET title=?,category=?,tags=?,updated_at=? WHERE id=?`,
+        )
+        .run(title, category, JSON.stringify(tags), nowIso(), id);
+      await syncRagSearchDocument(id);
+    });
     const row = (await getDb()
       .prepare(`${documentSelect} WHERE d.id=?`)
       .get(user.id, user.id, id)) as SqlRow;
@@ -227,13 +254,16 @@ export function createDocumentsRouter(): Router {
       const originalName = path.basename(
         normalizeUploadFilename(request.file.originalname),
       );
-      const { storedPath, extension } = await persistUpload(request.file, originalName);
+      const { storedPath, filePath, extension } = await persistUpload(
+        request.file,
+        originalName,
+      );
       try {
-        const extracted = await extractDocument(storedPath, extension);
+        const extracted = await extractUploadedDocument(filePath, extension);
         const content = extracted.text.trim();
         const nextVersion = Number(current.version) + 1;
         const chunkCount = await transaction(async () => {
-          const count = await replaceChunks(id, extracted);
+          const count = await replaceChunks(id, extracted, true, nextVersion);
           const timestamp = nowIso();
           await getDb()
             .prepare(
@@ -257,6 +287,7 @@ export function createDocumentsRouter(): Router {
                ) VALUES (?,?,?,?,?,?)`,
             )
             .run(id, nextVersion, originalName, storedPath, request.file!.size, timestamp);
+          await syncRagSearchDocument(id);
           return count;
         });
         response.status(201).json({
@@ -267,7 +298,7 @@ export function createDocumentsRouter(): Router {
           embedding_queued: queueDocumentEmbedding(id),
         });
       } catch (error) {
-        await fsp.rm(storedPath, { force: true });
+        await fsp.rm(filePath, { force: true });
         throw error;
       }
     },
@@ -280,7 +311,7 @@ export function createDocumentsRouter(): Router {
       await getDb()
         .prepare("SELECT stored_path FROM document_versions WHERE document_id=?")
         .all(id)
-    ).map((row) => String(row.stored_path));
+    ).map((row) => resolveStoredPath(String(row.stored_path)));
     await getDb().prepare("DELETE FROM documents WHERE id=?").run(id);
     await Promise.all([...new Set(paths)].map((file) => fsp.rm(file, { force: true })));
     response.status(204).end();
@@ -295,14 +326,17 @@ export function createDocumentsRouter(): Router {
       "Content-Disposition",
       `inline; filename*=UTF-8''${encodeURIComponent(String(row.filename))}`,
     );
-    response.sendFile(path.resolve(String(row.stored_path)));
+    response.sendFile(resolveStoredPath(String(row.stored_path)));
   });
 
   router.get("/:id/download", async (request: AuthRequest, response) => {
     const id = numberId(request.params.id);
     const row = await canAccessDocument(id, userOf(request));
     await getDb().prepare("UPDATE documents SET downloads=downloads+1 WHERE id=?").run(id);
-    response.download(String(row.stored_path), String(row.filename));
+    response.download(
+      resolveStoredPath(String(row.stored_path)),
+      String(row.filename),
+    );
   });
 
   router.get(
@@ -314,35 +348,12 @@ export function createDocumentsRouter(): Router {
         .prepare("SELECT * FROM document_versions WHERE id=? AND document_id=?")
         .get(numberId(request.params.versionId), id)) as SqlRow | undefined;
       if (!row) throw new ApiError(404, "历史版本不存在");
-      response.download(String(row.stored_path), String(row.filename));
+      response.download(
+        resolveStoredPath(String(row.stored_path)),
+        String(row.filename),
+      );
     },
   );
-
-  router.get("/:id/recommendations", async (request: AuthRequest, response) => {
-    const id = numberId(request.params.id);
-    const user = userOf(request);
-    const source = await canAccessDocument(id, user);
-    const access = accessibleDocumentWhere(user, "candidate");
-    const tags = tagsFromJson(source.tags);
-    const rows = (await getDb()
-      .prepare(
-        `SELECT candidate.id,candidate.title,candidate.category,candidate.tags,
-           candidate.views,candidate.downloads,
-           CASE WHEN candidate.category=? THEN 3 ELSE 0 END
-           + CASE WHEN candidate.tags LIKE ? THEN 2 ELSE 0 END AS relevance
-         FROM documents candidate
-         WHERE candidate.id<>? AND ${access.sql}
-         ORDER BY relevance DESC,candidate.views DESC,candidate.updated_at DESC
-         LIMIT 6`,
-      )
-      .all(
-        String(source.category),
-        tags.length ? `%"${tags[0]}"%` : "[]",
-        id,
-        ...access.params,
-      )) as SqlRow[];
-    response.json(rows.map((row) => ({ ...row, tags: tagsFromJson(row.tags) })));
-  });
 
   return router;
 }

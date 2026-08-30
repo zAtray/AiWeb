@@ -11,12 +11,17 @@ try {
   if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 }
 
-export const dataDirectory = path.resolve(
-  process.env.APP_DATA_DIR ?? path.join(projectRoot, "data"),
+function resolveProjectPath(value: string): string {
+  return path.isAbsolute(value) ? path.resolve(value) : path.resolve(projectRoot, value);
+}
+
+export const dataDirectory = resolveProjectPath(
+  process.env.APP_DATA_DIR ?? "data",
 );
 export const uploadDirectory = path.join(dataDirectory, "uploads");
 export const frontendDist = path.join(projectRoot, "frontend", "dist");
 export const port = Number(process.env.APP_PORT ?? 8000);
+export const host = process.env.APP_HOST?.trim() || "127.0.0.1";
 export const sessionHours = Number(process.env.SESSION_HOURS ?? 24);
 const configuredMaxUploadMb = Number(process.env.MAX_UPLOAD_MB ?? 50);
 export const maxUploadMb =
@@ -35,9 +40,9 @@ export const tesseractPath =
   process.env.TESSERACT_PATH?.trim() || "tesseract";
 export const pdfInfoPath = process.env.PDFINFO_PATH?.trim() || "pdfinfo";
 export const pdfToPpmPath = process.env.PDFTOPPM_PATH?.trim() || "pdftoppm";
-export const pdfOcrTempDirectory = path.resolve(
-  process.env.PDF_OCR_TEMP_DIR ?? path.join(dataDirectory, "ocr-temp"),
-);
+export const pdfOcrTempDirectory = process.env.PDF_OCR_TEMP_DIR
+  ? resolveProjectPath(process.env.PDF_OCR_TEMP_DIR)
+  : path.join(dataDirectory, "ocr-temp");
 const configuredPdfOcrMaxPages = Number(process.env.PDF_OCR_MAX_PAGES ?? 500);
 export const pdfOcrMaxPages = Number.isFinite(configuredPdfOcrMaxPages)
   ? Math.min(2_000, Math.max(1, Math.floor(configuredPdfOcrMaxPages)))
@@ -80,9 +85,58 @@ export const dbUser = process.env.DB_USER ?? "";
 export const dbPassword = process.env.DB_PASSWORD ?? "";
 export const dbName = process.env.DB_NAME ?? "knowledge_platform";
 export const dbConnectionLimit = Number(process.env.DB_CONNECTION_LIMIT ?? 10);
+export const acceptanceMode =
+  process.env.ACCEPTANCE_MODE?.trim().toLowerCase() === "true";
+
+export function assertAcceptanceDatabaseSafety(
+  enabled = acceptanceMode,
+  databaseName = dbName,
+): void {
+  if (enabled && !databaseName.startsWith("zhizhi_acceptance_")) {
+    throw new Error(
+      `验收模式拒绝连接非隔离数据库：${databaseName}`,
+    );
+  }
+}
 
 if (!dbUser) {
   throw new Error("缺少环境变量：DB_USER");
+}
+
+function requireDataPath(candidate: string): string {
+  const resolved = path.resolve(candidate);
+  const relative = path.relative(dataDirectory, resolved);
+  if (
+    relative === "" ||
+    (!relative.startsWith(`..${path.sep}`) &&
+      relative !== ".." &&
+      !path.isAbsolute(relative))
+  ) {
+    return resolved;
+  }
+  throw new Error(`文件路径超出 APP_DATA_DIR：${candidate}`);
+}
+
+export function resolveStoredPath(storedPath: string): string {
+  const value = storedPath.trim();
+  if (!value) throw new Error("文件存储路径为空");
+  const legacyDataDirectory = path.resolve("/app/data");
+  if (
+    value === legacyDataDirectory ||
+    value.startsWith(`${legacyDataDirectory}${path.sep}`)
+  ) {
+    return requireDataPath(
+      path.join(dataDirectory, path.relative(legacyDataDirectory, value)),
+    );
+  }
+  return requireDataPath(
+    path.isAbsolute(value) ? value : path.join(dataDirectory, value),
+  );
+}
+
+export function storedPathFromAbsolute(filePath: string): string {
+  const resolved = requireDataPath(filePath);
+  return path.relative(dataDirectory, resolved).split(path.sep).join("/");
 }
 
 export function ensureDirectories(): void {

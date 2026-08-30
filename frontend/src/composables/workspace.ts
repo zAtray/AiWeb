@@ -23,6 +23,7 @@ import type {
   DocumentItem,
   KnowledgeBase,
   ModelConnectionStatus,
+  RelatedDocument,
   RetrievalEngine,
   SearchHit,
   SearchResponse,
@@ -31,17 +32,19 @@ import type {
   ViewName,
 } from "../types";
 import { createDialogController } from "./dialog";
+import { createLatestRequestGate } from "./latest-request";
 import {
   createNoticeController,
   createPendingController,
-  createThemeController,
 } from "./ui";
 
 const fallbackConfig: AppConfig = {
   upload: {
     max_mb: 50,
     allowed_extensions: [".pdf", ".docx", ".txt", ".md"],
-    pdf_ocr_enabled: true,
+    pdf_ocr_enabled: false,
+    ocr_available: false,
+    ocr_message: "正在检测扫描 PDF OCR 能力…",
     pdf_ocr_max_pages: 500,
   },
 };
@@ -69,7 +72,6 @@ export const navigation: Array<{
   { id: "documents", label: "文档管理" },
   { id: "search", label: "知识检索" },
   { id: "shared", label: "知识广场" },
-  { id: "profile", label: "个人中心" },
   { id: "admin", label: "管理审核", admin: true },
 ];
 
@@ -81,10 +83,8 @@ export function createWorkspace() {
   const config = ref<AppConfig>(fallbackConfig);
   const noticeController = createNoticeController();
   const pendingController = createPendingController(noticeController.notify);
-  const themeController = createThemeController();
   const { notice, noticeError, notify, clearNotice } = noticeController;
   const { pending, anyPending, isPending, run } = pendingController;
-  const { theme, applyTheme, initializeTheme, toggleTheme } = themeController;
 
   const stats = ref<DashboardStats | null>(null);
   const knowledgeBases = ref<KnowledgeBase[]>([]);
@@ -96,8 +96,8 @@ export function createWorkspace() {
   const documentPreviewError = ref("");
   let documentPreviewRequest = 0;
   const comments = ref<CommentItem[]>([]);
-  const recommendations = ref<DocumentItem[]>([]);
   const searchResults = ref<SearchHit[]>([]);
+  const relatedDocuments = ref<RelatedDocument[]>([]);
   const searchEngine = ref<RetrievalEngine | null>(null);
   const sessions = ref<ChatSession[]>([]);
   const chatMessages = ref<ChatMessage[]>([]);
@@ -107,6 +107,7 @@ export function createWorkspace() {
   const modelStatus = ref<ModelConnectionStatus | null>(null);
   const shareRequests = ref<DocumentItem[]>([]);
   const users = ref<Array<User & { document_count: number }>>([]);
+  const sharedSort = ref<"hot" | "latest">("hot");
 
   const authMode = ref<"login" | "register">("login");
   const authForm = reactive({
@@ -147,6 +148,17 @@ export function createWorkspace() {
   const assignKnowledgeBaseId = ref("");
   const uploadInput = ref<HTMLInputElement | null>(null);
   const dialogController = createDialogController();
+  const documentDetailRequest = createLatestRequestGate();
+  const searchRequest = createLatestRequestGate();
+  const sessionRequest = createLatestRequestGate();
+  const chatRequest = createLatestRequestGate();
+  const activeChatRequestId = ref<number | null>(null);
+  const chatAnswerPending = computed(() => activeChatRequestId.value !== null);
+
+  function invalidateChatRequest(): void {
+    chatRequest.invalidate();
+    activeChatRequestId.value = null;
+  }
 
   const isAdmin = computed(() =>
     ["department_admin", "system_admin"].includes(user.value?.role ?? ""),
@@ -158,15 +170,15 @@ export function createWorkspace() {
   const modelStatusLabel = computed(() => {
     if (modelStatusBusy.value || !modelStatus.value) return "正在检测模型服务";
     return {
-      connected: "模型与向量服务已连接",
+      connected: "云端模型与向量服务已连接",
       model_missing: "服务在线，但所需模型不完整",
-      offline: "模型服务当前离线",
+      offline: "云端模型服务当前不可用",
       disabled: "AI 与向量能力尚未启用",
     }[modelStatus.value.status];
   });
   const modelStatusDetail = computed(() => {
     const status = modelStatus.value;
-    if (!status) return "正在连接 Ollama 服务…";
+    if (!status) return "正在检测云端 AI 配置…";
     if (status.status === "disabled") return "当前使用本地全文检索与证据摘要";
     if (status.status === "offline") return "问答将自动使用本地证据摘要";
     const parts = [
@@ -205,6 +217,38 @@ export function createWorkspace() {
     return item.user_id === user.value?.id || isAdmin.value;
   }
 
+  function clearUserWorkspaceState(): void {
+    documentDetailRequest.invalidate();
+    searchRequest.invalidate();
+    sessionRequest.invalidate();
+    invalidateChatRequest();
+    stats.value = null;
+    knowledgeBases.value = [];
+    documents.value = [];
+    sharedDocuments.value = [];
+    closeDocument();
+    comments.value = [];
+    searchResults.value = [];
+    relatedDocuments.value = [];
+    searchEngine.value = null;
+    sessions.value = [];
+    chatMessages.value = [];
+    currentSessionId.value = null;
+    chatEngine.value = null;
+    chatRetrievalEngine.value = null;
+    modelStatus.value = null;
+    shareRequests.value = [];
+    users.value = [];
+    searchForm.q = "";
+    searchForm.category = "";
+    searchForm.tag = "";
+    searchForm.knowledge_base_id = "";
+    chatForm.question = "";
+    chatForm.knowledge_base_id = "";
+    uploadForm.file = null;
+    assignKnowledgeBaseId.value = "";
+  }
+
   async function authenticate(): Promise<void> {
     clearNotice();
     const result = await run("auth", async () =>
@@ -227,6 +271,7 @@ export function createWorkspace() {
           }),
     );
     if (!result) return;
+    clearUserWorkspaceState();
     setToken(result.token);
     user.value = result.user;
     authForm.password = "";
@@ -238,7 +283,7 @@ export function createWorkspace() {
     if (getToken()) await run("logout", () => api("/api/auth/logout", { method: "POST" }));
     setToken("");
     user.value = null;
-    closeDocument();
+    clearUserWorkspaceState();
   }
 
   async function loadKnowledgeBases(): Promise<void> {
@@ -252,7 +297,7 @@ export function createWorkspace() {
     const params = new URLSearchParams();
     if (target === "shared") {
       params.set("scope", "shared");
-      params.set("sort", "hot");
+      params.set("sort", sharedSort.value);
     } else {
       Object.entries(documentFilters).forEach(([key, value]) => {
         if (value) params.set(key, value);
@@ -272,11 +317,17 @@ export function createWorkspace() {
   }
 
   async function changeView(view: ViewName): Promise<void> {
+    if (view !== "search") searchRequest.invalidate();
+    if (view !== "chat") {
+      sessionRequest.invalidate();
+      invalidateChatRequest();
+    }
+    documentDetailRequest.invalidate();
     activeView.value = view;
     mobileNav.value = false;
     closeAccountMenu();
     await run(`view:${view}`, async () => {
-      if (view === "dashboard" || view === "profile") {
+      if (view === "dashboard") {
         stats.value = await api("/api/stats");
       }
       if (view === "knowledge") await loadKnowledgeBases();
@@ -441,6 +492,7 @@ export function createWorkspace() {
   }
 
   function closeDocument(): void {
+    documentDetailRequest.invalidate();
     selectedDocument.value = null;
     clearDocumentPreview();
   }
@@ -466,15 +518,15 @@ export function createWorkspace() {
   }
 
   async function loadDocumentDetail(id: number, reloadPreview = false): Promise<void> {
+    const requestId = documentDetailRequest.begin();
     const previousId = selectedDocument.value?.id;
-    const [detail, commentList, related] = await Promise.all([
+    const [detail, commentList] = await Promise.all([
       api<DocumentItem>(`/api/documents/${id}`),
       api<CommentItem[]>(`/api/documents/${id}/comments`),
-      api<DocumentItem[]>(`/api/documents/${id}/recommendations`),
     ]);
+    if (!documentDetailRequest.isCurrent(requestId)) return;
     selectedDocument.value = detail;
     comments.value = commentList;
-    recommendations.value = related;
     metadataForm.title = detail.title;
     metadataForm.category = detail.category;
     metadataForm.tags = detail.tags.join(", ");
@@ -659,6 +711,7 @@ export function createWorkspace() {
 
   async function search(): Promise<void> {
     if (!searchForm.q.trim()) {
+      searchRequest.invalidate();
       notify("请输入检索内容", true);
       return;
     }
@@ -666,31 +719,46 @@ export function createWorkspace() {
     Object.entries(searchForm).forEach(([key, value]) => {
       if (key !== "q" && value) params.set(key, value);
     });
+    const requestId = searchRequest.begin();
     const result = await run("search", () =>
       api<SearchResponse>(`/api/search?${params}`),
     );
-    if (!result) return;
+    if (!result || !searchRequest.isCurrent(requestId)) return;
     searchResults.value = result.results;
+    relatedDocuments.value = result.related_documents;
     searchEngine.value = result.retrieval_engine;
   }
 
   async function ask(): Promise<void> {
     const question = chatForm.question.trim();
-    if (!question || isPending("chat:ask")) return;
-    chatMessages.value.push({ role: "user", content: question, citations: [] });
+    if (!question || chatAnswerPending.value) return;
+    sessionRequest.invalidate();
+    const requestId = chatRequest.begin();
+    activeChatRequestId.value = requestId;
+    const sessionId = currentSessionId.value;
+    const knowledgeBaseId = chatForm.knowledge_base_id || null;
+    const optimisticMessage: ChatMessage = {
+      role: "user",
+      content: question,
+      citations: [],
+    };
+    chatMessages.value.push(optimisticMessage);
     chatForm.question = "";
     const result = await run("chat:ask", () =>
       api<ChatResponse>("/api/chat/ask", {
         method: "POST",
         body: JSON.stringify({
           question,
-          knowledge_base_id: chatForm.knowledge_base_id || null,
-          session_id: currentSessionId.value,
+          knowledge_base_id: knowledgeBaseId,
+          session_id: sessionId,
         }),
       }),
     );
+    if (activeChatRequestId.value === requestId) activeChatRequestId.value = null;
+    if (!chatRequest.isCurrent(requestId)) return;
     if (!result) {
-      chatMessages.value.pop();
+      const index = chatMessages.value.indexOf(optimisticMessage);
+      if (index >= 0) chatMessages.value.splice(index, 1);
       chatForm.question = question;
       return;
     }
@@ -707,10 +775,12 @@ export function createWorkspace() {
   }
 
   async function openSession(session: ChatSession): Promise<void> {
+    invalidateChatRequest();
+    const requestId = sessionRequest.begin();
     const result = await run("chat:session", () =>
       api<{ messages: ChatMessage[] }>(`/api/chat/sessions/${session.id}`),
     );
-    if (!result) return;
+    if (!result || !sessionRequest.isCurrent(requestId)) return;
     currentSessionId.value = session.id;
     chatMessages.value = result.messages;
     chatForm.knowledge_base_id = session.knowledge_base_id
@@ -719,6 +789,8 @@ export function createWorkspace() {
   }
 
   function newSession(): void {
+    invalidateChatRequest();
+    sessionRequest.invalidate();
     currentSessionId.value = null;
     chatMessages.value = [];
     chatForm.question = "";
@@ -822,13 +894,13 @@ export function createWorkspace() {
   }
 
   function handleAuthExpired(): void {
+    setToken("");
     user.value = null;
-    closeDocument();
+    clearUserWorkspaceState();
     notify("登录已过期，请重新登录", true);
   }
 
   async function initialize(): Promise<void> {
-    initializeTheme();
     document.addEventListener("click", closeAccountMenu);
     window.addEventListener("auth-expired", handleAuthExpired);
     const loadedConfig = await run("config", () => api<AppConfig>("/api/config"));
@@ -852,7 +924,6 @@ export function createWorkspace() {
     activeView,
     mobileNav,
     accountMenuOpen,
-    theme,
     config,
     pending,
     anyPending,
@@ -867,20 +938,22 @@ export function createWorkspace() {
     documentPreviewLoading,
     documentPreviewError,
     comments,
-    recommendations,
     searchResults,
+    relatedDocuments,
     searchEngine,
     sessions,
     chatMessages,
     currentSessionId,
     chatEngine,
     chatRetrievalEngine,
+    chatAnswerPending,
     modelStatus,
     modelStatusBusy,
     modelStatusLabel,
     modelStatusDetail,
     shareRequests,
     users,
+    sharedSort,
     authMode,
     authForm,
     kbForm,
@@ -900,8 +973,6 @@ export function createWorkspace() {
     isPending,
     notify,
     clearNotice,
-    applyTheme,
-    toggleTheme,
     closeAccountMenu,
     toggleAccountMenu,
     canManageDocument,

@@ -27,6 +27,21 @@ function apiErrorHandler(
   response: Response,
   _next: NextFunction,
 ): void {
+  const requestError = error as { status?: number; type?: string; code?: string };
+  if (
+    requestError.type === "entity.parse.failed" ||
+    (error instanceof SyntaxError && requestError.status === 400)
+  ) {
+    response.status(400).json({ message: "JSON 请求格式错误" });
+    return;
+  }
+  if (
+    requestError.type === "entity.too.large" ||
+    requestError.status === 413
+  ) {
+    response.status(413).json({ message: "JSON 请求体超过 1 MB 限制" });
+    return;
+  }
   if (error instanceof multer.MulterError) {
     response
       .status(413)
@@ -34,7 +49,10 @@ function apiErrorHandler(
     return;
   }
   if (error instanceof ApiError) {
-    response.status(error.status).json({ message: error.message });
+    response.status(error.status).json({
+      message: error.message,
+      ...(error.code ? { error: error.code } : {}),
+    });
     return;
   }
   if (
@@ -45,9 +63,7 @@ function apiErrorHandler(
     return;
   }
   console.error(error);
-  response.status(500).json({
-    message: error instanceof Error ? error.message : "服务器内部错误",
-  });
+  response.status(500).json({ message: "服务器内部错误" });
 }
 
 export async function createApp() {
@@ -66,6 +82,10 @@ export async function createApp() {
   app.use("/api/chat", createChatRouter());
   app.use("/api/admin", createAdminRouter());
   app.use("/api/stats", createStatsRouter());
+  // Unmatched /api paths return JSON 404 instead of the SPA fallback.
+  app.use("/api", (_request, response) => {
+    response.status(404).json({ message: "接口不存在" });
+  });
 
   if (fs.existsSync(frontendDist)) {
     app.use(express.static(frontendDist));

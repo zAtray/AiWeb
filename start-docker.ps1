@@ -82,8 +82,12 @@ if ($script:appPort -lt 1 -or $script:appPort -gt 65535) {
 
 Push-Location $projectRoot
 try {
-  Write-Host "正在构建并启动 AiWeb。首次运行会下载 MySQL、Ollama 和约数 GB 的模型。"
-  & docker compose --env-file $environmentFile up -d --build
+  Write-Host "正在构建并启动 AiWeb 与 MySQL。LLM 和 Embedding 使用后端配置的云端 API。"
+  & docker compose `
+    -f compose.yaml `
+    -f compose.production.yaml `
+    --env-file $environmentFile `
+    up -d --build
   if ($LASTEXITCODE -ne 0) { throw "docker compose 启动失败。" }
 
   $deadline = [DateTime]::UtcNow.AddMinutes(45)
@@ -95,12 +99,16 @@ try {
       exit 0
     }
     if ([DateTime]::UtcNow -ge $nextStatus) {
-      & docker compose --env-file $environmentFile ps
+      & docker compose `
+        -f compose.yaml `
+        -f compose.production.yaml `
+        --env-file $environmentFile `
+        ps
       $nextStatus = [DateTime]::UtcNow.AddSeconds(20)
     }
     Start-Sleep -Seconds 2
   }
-  throw "45 分钟内未通过健康检查。请运行 docker compose --env-file .env.docker logs --tail 200。"
+  throw "45 分钟内未通过健康检查。请组合 compose.yaml 与 compose.production.yaml 查看日志。"
 } finally {
   Pop-Location
 }

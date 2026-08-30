@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import type { Server } from "node:http";
 import { createApp } from "./app.js";
+import { resolveStoredPath } from "./config.js";
 import { closeDb, getDb } from "./db.js";
 
 const totalRequests = Number(process.env.STRESS_REQUESTS ?? 2_000);
@@ -143,7 +144,9 @@ async function cleanupFixture(
     .run(userId);
   await getDb().prepare("DELETE FROM users WHERE id=?").run(userId);
   await Promise.all(
-    [...new Set(storedPaths)].map((file) => fs.rm(file, { force: true })),
+    [...new Set(storedPaths)].map((file) =>
+      fs.rm(resolveStoredPath(file), { force: true }),
+    ),
   );
 }
 
@@ -235,8 +238,8 @@ async function runLoad(
 }
 
 async function main(): Promise<void> {
-  process.env.LOCAL_LLM_ENABLED = "false";
-  process.env.EMBEDDING_ENABLED = "false";
+  process.env.LLM_PROVIDER = "disabled";
+  process.env.EMBEDDING_PROVIDER = "disabled";
 
   const app = await createApp();
   const server = await new Promise<Server>((resolve) => {

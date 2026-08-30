@@ -8,10 +8,13 @@ if (-not (Test-Path -LiteralPath $environmentFile)) {
 
 Push-Location $projectRoot
 try {
-  & docker compose --env-file $environmentFile down
+  & docker compose `
+    -f compose.yaml `
+    -f compose.production.yaml `
+    --env-file $environmentFile `
+    down
   if ($LASTEXITCODE -ne 0) { throw "docker compose 停止失败。" }
   Write-Host "AiWeb 已停止。数据库、上传文件和模型仍保留在 Docker volumes 中。"
 } finally {
   Pop-Location
 }
-

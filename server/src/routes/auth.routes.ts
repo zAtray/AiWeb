@@ -22,12 +22,19 @@ export function createAuthRouter(): Router {
     const email = optionalText(request.body?.email, 120) || null;
     const phone = optionalText(request.body?.phone, 30) || null;
     const db = getDb();
+    const identifiers = [...new Set([username, email, phone].filter(
+      (value): value is string => Boolean(value),
+    ))];
+    const placeholders = identifiers.map(() => "?").join(",");
     const duplicate = await db
       .prepare(
-        `SELECT id FROM users WHERE username=?
-         OR (? IS NOT NULL AND email=?) OR (? IS NOT NULL AND phone=?)`,
+        `SELECT id FROM users
+         WHERE username IN (${placeholders})
+            OR email IN (${placeholders})
+            OR phone IN (${placeholders})
+         LIMIT 1`,
       )
-      .get(username, email, email, phone, phone);
+      .get(...identifiers, ...identifiers, ...identifiers);
     if (duplicate) throw new ApiError(409, "用户名、邮箱或手机号已被使用");
     const result = await db
       .prepare(

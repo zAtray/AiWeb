@@ -1,34 +1,80 @@
 <script setup lang="ts">
-import { computed, inject, onBeforeUnmount, onMounted } from "vue";
+import { computed, inject, onBeforeUnmount, onMounted, ref } from "vue";
 import { requireWorkspace, workspaceKey } from "../composables/workspace";
 import { formatBytes, formatDate, shareLabel } from "../formatters";
 
 const w = requireWorkspace(inject(workspaceKey));
 const isPdf = computed(() => w.selectedDocument.value?.file_type === "PDF");
 let previousBodyOverflow = "";
+const dialogRef = ref<HTMLElement | null>(null);
+let previouslyFocused: HTMLElement | null = null;
+
+const focusableSelector = [
+  "a[href]",
+  "button:not([disabled])",
+  'input:not([disabled]):not([type="file"])',
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex=\"-1\"])",
+].join(",");
+
+function focusableElements(): HTMLElement[] {
+  const root = dialogRef.value;
+  if (!root) return [];
+  return Array.from(
+    root.querySelectorAll<HTMLElement>(focusableSelector),
+  ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+}
 
 function close(): void {
   w.closeDocument();
 }
 
 function handleKeydown(event: KeyboardEvent): void {
-  if (event.key === "Escape" && !w.dialog.value) close();
+  if (event.key === "Escape" && !w.dialog.value) {
+    close();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const elements = focusableElements();
+  if (!elements.length) {
+    event.preventDefault();
+    dialogRef.value?.focus();
+    return;
+  }
+  const first = elements[0]!;
+  const last = elements[elements.length - 1]!;
+  if (event.shiftKey) {
+    if (document.activeElement === first || !dialogRef.value?.contains(document.activeElement)) {
+      event.preventDefault();
+      last.focus();
+    }
+  } else {
+    if (document.activeElement === last || !dialogRef.value?.contains(document.activeElement)) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 }
 
 onMounted(() => {
   previousBodyOverflow = document.body.style.overflow;
   document.body.style.overflow = "hidden";
+  previouslyFocused = document.activeElement as HTMLElement | null;
   window.addEventListener("keydown", handleKeydown);
+  const closeBtn = dialogRef.value?.querySelector<HTMLElement>("[aria-label=\"关闭文档详情\"]");
+  (closeBtn ?? dialogRef.value)?.focus();
 });
 onBeforeUnmount(() => {
   document.body.style.overflow = previousBodyOverflow;
   window.removeEventListener("keydown", handleKeydown);
+  previouslyFocused?.focus();
 });
 </script>
 
 <template>
   <div v-if="w.selectedDocument.value" class="modal-backdrop document-reader-backdrop" @click.self="close">
-    <section class="detail-drawer" role="dialog" aria-modal="true" aria-label="文档详情">
+    <section ref="dialogRef" class="detail-drawer" role="dialog" aria-modal="true" aria-label="文档详情" tabindex="-1">
       <header>
         <div>
           <p class="eyebrow">{{ w.selectedDocument.value.file_type }} · VERSION {{ w.selectedDocument.value.version }}</p>
@@ -124,16 +170,6 @@ onBeforeUnmount(() => {
           </div>
         </section>
       </div>
-
-      <section class="recommendations">
-        <h4>相关知识推荐</h4>
-        <div>
-          <button v-for="item in w.recommendations.value" :key="item.id" @click="w.openDocument(item)">
-            {{ item.title }}<small>{{ item.category }}</small>
-          </button>
-          <p v-if="!w.recommendations.value.length" class="muted">暂无相关推荐。</p>
-        </div>
-      </section>
 
       <section class="comment-section">
         <h4>评论交流</h4>

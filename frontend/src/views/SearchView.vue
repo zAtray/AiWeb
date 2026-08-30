@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { inject } from "vue";
+import { computed, inject } from "vue";
+import { searchEmptyCopy } from "../composables/latest-request";
 import { requireWorkspace, workspaceKey } from "../composables/workspace";
 
 const w = requireWorkspace(inject(workspaceKey));
+const emptyCopy = computed(() => searchEmptyCopy(Boolean(w.searchEngine.value)));
 </script>
 
 <template>
@@ -28,6 +30,28 @@ const w = requireWorkspace(inject(workspaceKey));
       <span>{{ w.searchResults.value.length }} 条结果</span>
       <span>{{ w.searchEngine.value === "hybrid-vector-lexical" ? "向量 + 关键词混合检索" : "关键词全文检索" }}</span>
     </div>
+    <section v-if="w.searchEngine.value" class="related-documents panel" aria-labelledby="related-documents-title">
+      <div class="panel-title">
+        <div>
+          <p class="eyebrow">RELATED KNOWLEDGE</p>
+          <h3 id="related-documents-title">相关知识文档</h3>
+        </div>
+        <span>{{ w.relatedDocuments.value.length }} 份推荐</span>
+      </div>
+      <div v-if="w.relatedDocuments.value.length" class="related-document-grid">
+        <button
+          v-for="item in w.relatedDocuments.value"
+          :key="item.id"
+          @click="w.openDocument(item)"
+        >
+          <span>{{ item.category }}</span>
+          <b>{{ item.title }}</b>
+          <small>相关度 {{ Math.round(item.score * 100) }}% · 命中 {{ item.matched_fragments }} 个片段</small>
+          <i>{{ item.tags.slice(0, 3).map((tag) => `#${tag}`).join(" ") || "暂无标签" }}</i>
+        </button>
+      </div>
+      <p v-else class="muted">当前查询暂无可推荐的相关文档。</p>
+    </section>
     <section class="result-stack">
       <article v-for="(item, index) in w.searchResults.value" :key="item.chunk_id">
         <div class="result-rank">{{ String(index + 1).padStart(2, "0") }}</div>
@@ -38,7 +62,7 @@ const w = requireWorkspace(inject(workspaceKey));
         </div>
       </article>
       <div v-if="!w.searchResults.value.length" class="empty-card">
-        <b>等待检索</b><span>输入检索词后，系统会显示原文片段与来源。</span>
+        <b>{{ emptyCopy.title }}</b><span>{{ emptyCopy.description }}</span>
       </div>
     </section>
   </div>

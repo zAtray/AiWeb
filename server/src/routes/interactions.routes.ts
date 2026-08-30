@@ -1,7 +1,7 @@
 import { Router, type Response } from "express";
 import { requireUser } from "../auth.js";
 import { ApiError, numberId, text } from "../core.js";
-import { getDb, nowIso } from "../db.js";
+import { getDb, nowIso, transaction } from "../db.js";
 import { canAccessDocument, userOf } from "../services.js";
 import type { AuthRequest, SqlRow } from "../types.js";
 
@@ -13,26 +13,55 @@ async function toggleRelation(
   const id = numberId(request.params.id);
   const user = userOf(request);
   await canAccessDocument(id, user);
-  const existing = await getDb()
-    .prepare(`SELECT 1 FROM ${table} WHERE user_id=? AND document_id=?`)
-    .get(user.id, id);
-  if (existing) {
-    await getDb()
-      .prepare(`DELETE FROM ${table} WHERE user_id=? AND document_id=?`)
-      .run(user.id, id);
-  } else {
-    await getDb()
-      .prepare(
-        `INSERT INTO ${table}(user_id,document_id,created_at) VALUES (?,?,?)`,
-      )
-      .run(user.id, id, nowIso());
-  }
+  const active = await transaction(async () => {
+    const existing = await getDb()
+      .prepare(`SELECT 1 FROM ${table} WHERE user_id=? AND document_id=? FOR UPDATE`)
+      .get(user.id, id);
+    if (existing) {
+      await getDb().prepare(`DELETE FROM ${table} WHERE user_id=? AND document_id=?`)
+        .run(user.id, id);
+      return false;
+    }
+    try {
+      await getDb()
+        .prepare(`INSERT INTO ${table}(user_id,document_id,created_at) VALUES (?,?,?)`)
+        .run(user.id, id, nowIso());
+      return true;
+    } catch (error) {
+      // 并发 toggle 可能在 SELECT 与 INSERT 之间由另一事务插入同一行，
+      // 触发唯一约束冲突。此时该行已存在，按 toggle 语义将其删除即可，
+      // 不应向用户返回 409 错误。
+      if ((error as NodeJS.ErrnoException).code === "ER_DUP_ENTRY") {
+        await getDb().prepare(`DELETE FROM ${table} WHERE user_id=? AND document_id=?`)
+          .run(user.id, id);
+        return false;
+      }
+      throw error;
+    }
+  });
   const count = (
     await getDb()
       .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE document_id=?`)
       .get(id)
   )!.count;
-  response.json({ active: !existing, count: Number(count) });
+  response.json({ active, count: Number(count) });
+}
+
+async function setLike(request: AuthRequest, response: Response, active: boolean): Promise<void> {
+  const id = numberId(request.params.id);
+  const user = userOf(request);
+  await canAccessDocument(id, user);
+  if (active) {
+    await getDb().prepare(
+      `INSERT INTO likes(user_id,document_id,created_at) VALUES (?,?,?)
+       ON DUPLICATE KEY UPDATE created_at=created_at`,
+    ).run(user.id, id, nowIso());
+  } else {
+    await getDb().prepare("DELETE FROM likes WHERE user_id=? AND document_id=?")
+      .run(user.id, id);
+  }
+  const row = await getDb().prepare("SELECT COUNT(*) AS count FROM likes WHERE document_id=?").get(id);
+  response.json({ active, count: Number(row?.count ?? 0) });
 }
 
 export function createInteractionsRouter(): Router {
@@ -45,6 +74,12 @@ export function createInteractionsRouter(): Router {
 
   router.post("/documents/:id/like", (request: AuthRequest, response) =>
     toggleRelation("likes", request, response),
+  );
+  router.put("/documents/:id/like", (request: AuthRequest, response) =>
+    setLike(request, response, true),
+  );
+  router.delete("/documents/:id/like", (request: AuthRequest, response) =>
+    setLike(request, response, false),
   );
 
   router.get("/documents/:id/comments", async (request: AuthRequest, response) => {

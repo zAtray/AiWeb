@@ -5,12 +5,14 @@ import { hashPassword } from "./auth.js";
 import {
   allowedExtensions,
   defaultAdminPassword,
+  storedPathFromAbsolute,
   uploadDirectory,
 } from "./config.js";
 import { ApiError, tagsFromJson } from "./core.js";
 import { getDb, nowIso } from "./db.js";
 import {
   chunkText,
+  qualityScore,
   structuredChunks,
   type ExtractedDocument,
   type StructuredChunk,
@@ -18,11 +20,14 @@ import {
 import {
   cosineSimilarity,
   embedTexts,
+  embeddingGeneration,
   embeddingMinimumScore,
   embeddingModelEnabled,
   embeddingModelName,
+  embeddingProviderName,
 } from "./embeddings.js";
-import { lexicalScore, queryTerms } from "./search.js";
+import { dedupeTopK, weightedRrf, type RankedChannel } from "./rag-pipeline.js";
+import { queryTerms } from "./search.js";
 import type {
   AuthRequest,
   SearchResult,
@@ -122,6 +127,7 @@ export async function replaceChunks(
   documentId: number,
   source: string | ExtractedDocument,
   replaceExisting = true,
+  documentVersion?: number,
 ): Promise<number> {
   let chunks: StructuredChunk[] = typeof source === "string"
     ? chunkText(source).map((content) => ({
@@ -132,9 +138,25 @@ export async function replaceChunks(
         section: null,
         contentType: "content" as const,
         qualityScore: 1,
-      }))
+    }))
     : structuredChunks(source);
   if (!chunks.length && typeof source !== "string") {
+    const audit = source.audit;
+    const rejectedByCleaning = Boolean(
+      audit && (
+        audit.advertisementLines > 0 ||
+        audit.repeatedMarginLines > 0 ||
+        audit.pageNumberLines > 0 ||
+        audit.replacementCharacters > 0 ||
+        audit.privateUseCharacters > 0
+      ),
+    ) || qualityScore(source.text) < 0.48;
+    if (rejectedByCleaning) {
+      throw new ApiError(
+        422,
+        "文档内容全部被判定为广告、乱码或低质量文本，已拒绝建立索引",
+      );
+    }
     chunks = chunkText(source.text).map((content) => ({
       content,
       pageStart: null,
@@ -152,6 +174,10 @@ export async function replaceChunks(
     );
   }
   const db = getDb();
+  const document = await db.prepare(
+    "SELECT version FROM documents WHERE id=?",
+  ).get(documentId);
+  const effectiveVersion = documentVersion ?? Number(document?.version ?? 1);
   if (replaceExisting) {
     await db
       .prepare("DELETE FROM document_chunks WHERE document_id=?")
@@ -159,13 +185,14 @@ export async function replaceChunks(
   }
   const insert = db.prepare(
     `INSERT INTO document_chunks(
-      document_id,chunk_index,content,page_start,page_end,chapter,section,
+      document_id,document_version,chunk_index,content,page_start,page_end,chapter,section,
       content_type,quality_score
-     ) VALUES (?,?,?,?,?,?,?,?,?)`,
+     ) VALUES (?,?,?,?,?,?,?,?,?,?)`,
   );
   for (const [index, chunk] of chunks.entries()) {
     await insert.run(
       documentId,
+      effectiveVersion,
       index,
       chunk.content,
       chunk.pageStart,
@@ -176,23 +203,79 @@ export async function replaceChunks(
       chunk.qualityScore,
     );
   }
+  await db.prepare(
+    `INSERT INTO rag_chunk_search(
+       chunk_id,document_id,document_version,content,title,filename,tags,chapter,section
+     ) SELECT c.id,c.document_id,c.document_version,c.content,d.title,d.filename,d.tags,c.chapter,c.section
+         FROM document_chunks c JOIN documents d ON d.id=c.document_id
+        WHERE c.document_id=? AND c.document_version=?
+     ON DUPLICATE KEY UPDATE
+       document_id=VALUES(document_id),document_version=VALUES(document_version),
+       content=VALUES(content),title=VALUES(title),filename=VALUES(filename),tags=VALUES(tags),
+       chapter=VALUES(chapter),section=VALUES(section)`,
+  ).run(documentId, effectiveVersion);
   return chunks.length;
+}
+
+export async function syncRagSearchDocument(documentId: number): Promise<number> {
+  const result = await getDb().prepare(
+    `INSERT INTO rag_chunk_search(
+       chunk_id,document_id,document_version,content,title,filename,tags,chapter,section
+     ) SELECT c.id,c.document_id,c.document_version,c.content,d.title,d.filename,d.tags,c.chapter,c.section
+         FROM document_chunks c JOIN documents d ON d.id=c.document_id
+        WHERE c.document_id=? AND c.document_version=d.version
+     ON DUPLICATE KEY UPDATE
+       document_id=VALUES(document_id),document_version=VALUES(document_version),
+       content=VALUES(content),title=VALUES(title),filename=VALUES(filename),tags=VALUES(tags),
+       chapter=VALUES(chapter),section=VALUES(section)`,
+  ).run(documentId);
+  return result.changes;
 }
 
 export async function persistUpload(
   file: Express.Multer.File,
   originalName = file.originalname,
-): Promise<{ storedPath: string; extension: string }> {
+): Promise<{ storedPath: string; filePath: string; extension: string }> {
   const extension = path.extname(originalName).toLowerCase();
   if (!allowedExtensions.has(extension)) {
     throw new ApiError(415, "仅支持 PDF、DOCX、TXT、Markdown 文件");
   }
-  const storedPath = path.join(
+  const mime = file.mimetype.trim().toLowerCase();
+  const mimeByExtension: Record<string, Set<string>> = {
+    ".pdf": new Set(["application/pdf", "application/octet-stream"]),
+    ".docx": new Set([
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/octet-stream",
+    ]),
+    ".txt": new Set(["text/plain", "application/octet-stream"]),
+    ".md": new Set(["text/markdown", "text/plain", "application/octet-stream"]),
+  };
+  if (!mimeByExtension[extension]?.has(mime)) {
+    throw new ApiError(415, "文件扩展名与 MIME 类型不匹配");
+  }
+  const bytes = file.buffer;
+  const hasPdfSignature = bytes.subarray(0, 5).toString("ascii") === "%PDF-";
+  const hasZipSignature = bytes[0] === 0x50 && bytes[1] === 0x4b && [0x03, 0x05, 0x07]
+    .includes(bytes[2] ?? -1);
+  const hasExecutableSignature = bytes[0] === 0x4d && bytes[1] === 0x5a;
+  const containsNul = bytes.subarray(0, Math.min(bytes.length, 8_192)).includes(0);
+  if (
+    (extension === ".pdf" && !hasPdfSignature) ||
+    (extension === ".docx" && !hasZipSignature) ||
+    ((extension === ".txt" || extension === ".md") && (hasExecutableSignature || containsNul))
+  ) {
+    throw new ApiError(415, "文件内容签名与扩展名不匹配");
+  }
+  const filePath = path.join(
     uploadDirectory,
     `${crypto.randomUUID().replaceAll("-", "")}${extension}`,
   );
-  await fsp.writeFile(storedPath, file.buffer);
-  return { storedPath, extension };
+  await fsp.writeFile(filePath, file.buffer);
+  return {
+    storedPath: storedPathFromAbsolute(filePath),
+    filePath,
+    extension,
+  };
 }
 
 export async function searchChunks(
@@ -208,7 +291,12 @@ export async function searchChunks(
   } = {},
 ): Promise<SearchResult> {
   const access = accessibleDocumentWhere(user);
-  const clauses = [access.sql];
+  const clauses = [
+    access.sql,
+    "d.status='ready'",
+    "c.document_version=d.version",
+    "s.document_version=d.version",
+  ];
   const parameters: Array<string | number> = [...access.params];
   let join = "";
   if (options.knowledgeBaseId) {
@@ -238,34 +326,21 @@ export async function searchChunks(
     clauses.push("d.tags LIKE ?");
     parameters.push(`%"${options.tag}"%`);
   }
-  const terms = queryTerms(query).slice(0, 4);
-  const lexicalClauses = [...clauses];
-  const lexicalParameters = [...parameters];
-  if (terms.length) {
-    lexicalClauses.push(
-      `(${terms
-        .map(() => "(c.content LIKE ? OR d.title LIKE ? OR d.tags LIKE ?)")
-        .join(" OR ")})`,
-    );
-    for (const term of terms) {
-      lexicalParameters.push(`%${term}%`, `%${term}%`, `%${term}%`);
-    }
-  }
-  const lexicalRows = await getDb()
-    .prepare(
-      `SELECT c.id AS chunk_id,c.chunk_index,c.content,c.page_start,c.page_end,
-        c.chapter,c.section,c.content_type,c.quality_score,
-        d.id AS document_id,d.title,d.category,d.tags,d.updated_at
-       FROM document_chunks c JOIN documents d ON d.id=c.document_id
-       ${join} WHERE ${lexicalClauses.join(" AND ")}`,
-    )
-    .all(...lexicalParameters) as SqlRow[];
-  const lexicalHits = lexicalRows
-    .map((row) => ({
+  const limit = options.limit ?? 12;
+  const candidateLimit = Math.max(60, Math.min(500, limit * 8));
+  const select = `SELECT c.id AS chunk_id,c.chunk_index,c.document_version,c.content,
+      c.page_start,c.page_end,c.chapter,c.section,c.content_type,c.quality_score,
+      d.id AS document_id,d.title,d.filename,d.category,d.tags,d.updated_at`;
+  const from = `FROM rag_chunk_search s
+      JOIN document_chunks c ON c.id=s.chunk_id
+      JOIN documents d ON d.id=c.document_id ${join}`;
+  const toHit = (row: SqlRow): SearchHit => ({
       chunk_id: Number(row.chunk_id),
       chunk_index: Number(row.chunk_index),
+      document_version: Number(row.document_version),
       document_id: Number(row.document_id),
       title: String(row.title),
+      filename: String(row.filename),
       category: String(row.category),
       tags: tagsFromJson(row.tags),
       content: String(row.content),
@@ -275,67 +350,61 @@ export async function searchChunks(
       section: row.section ? String(row.section) : null,
       content_type: String(row.content_type ?? "content") as SearchHit["content_type"],
       quality_score: Number(row.quality_score ?? 1),
-      score: Number(
-        lexicalScore(
-          query,
-          String(row.content),
-          String(row.title),
-          String(row.tags),
-        ).toFixed(4),
-      ),
-      lexical_score: Number(
-        lexicalScore(
-          query,
-          String(row.content),
-          String(row.title),
-          String(row.tags),
-        ).toFixed(4),
-      ),
-    }))
-    .filter((row) => row.score > 0)
-    .sort((left, right) => right.score - left.score);
-  const limit = options.limit ?? 12;
-  if (!embeddingModelEnabled()) {
-    return { engine: "lexical", hits: lexicalHits.slice(0, limit) };
+      score: Number(row.channel_score ?? 0),
+      lexical_score: row.channel_score === undefined ? undefined : Number(row.channel_score),
+    });
+  const contentRows = await getDb().prepare(
+    `${select},MATCH(s.content,s.chapter,s.section)
+       AGAINST (? IN NATURAL LANGUAGE MODE) AS channel_score
+     ${from}
+     WHERE MATCH(s.content,s.chapter,s.section) AGAINST (? IN NATURAL LANGUAGE MODE)>0
+       AND ${clauses.join(" AND ")}
+     ORDER BY channel_score DESC,c.id ASC LIMIT ${candidateLimit}`,
+  ).all(query, query, ...parameters);
+  const metadataRows = await getDb().prepare(
+    `${select},MATCH(s.title,s.filename,s.tags)
+       AGAINST (? IN NATURAL LANGUAGE MODE) AS channel_score
+     ${from}
+     WHERE MATCH(s.title,s.filename,s.tags) AGAINST (? IN NATURAL LANGUAGE MODE)>0
+       AND ${clauses.join(" AND ")}
+     ORDER BY channel_score DESC,c.id ASC LIMIT ${candidateLimit}`,
+  ).all(query, query, ...parameters);
+  const exactTerms = queryTerms(query)
+    .filter((term) => term.length >= 2 && term.length <= 80)
+    .slice(0, 8);
+  let exactRows: SqlRow[] = [];
+  if (exactTerms.length) {
+    const exactClauses = exactTerms.map((term) => term.length >= 4
+      ? "(s.content LIKE ? OR s.title LIKE ? OR s.filename LIKE ? OR s.tags LIKE ?)"
+      : "(s.title LIKE ? OR s.filename LIKE ? OR s.tags LIKE ?)");
+    const exactParameters = exactTerms.flatMap((term) => term.length >= 4
+      ? [`%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`]
+      : [`%${term}%`, `%${term}%`, `%${term}%`]);
+    exactRows = await getDb().prepare(
+      `${select},1 AS channel_score ${from}
+       WHERE (${exactClauses.join(" OR ")}) AND ${clauses.join(" AND ")}
+       ORDER BY c.id ASC LIMIT ${candidateLimit}`,
+    ).all(...exactParameters, ...parameters);
   }
-
-  const indexedInScope = await getDb()
-    .prepare(
-      `SELECT 1 AS available
-       FROM document_chunks c
-       JOIN documents d ON d.id=c.document_id
-       JOIN chunk_embeddings e ON e.chunk_id=c.id
-       ${join}
-       WHERE e.model=? AND ${clauses.join(" AND ")}
-       LIMIT 1`,
-    )
-    .get(embeddingModelName(), ...parameters);
-  if (!indexedInScope) {
-    return { engine: "lexical", hits: lexicalHits.slice(0, limit) };
-  }
-
+  const contentHits = contentRows.map(toHit);
+  const metadataHits = metadataRows.map(toHit);
+  const exactHits = exactRows.map(toHit);
+  let vectorHits: SearchHit[] = [];
   try {
-    const queryVector = (await embedTexts([query]))[0];
-    if (!queryVector) {
-      return { engine: "lexical", hits: lexicalHits.slice(0, limit) };
-    }
-    const semanticRows = (await getDb()
-      .prepare(
-        `SELECT c.id AS chunk_id,c.chunk_index,c.content,c.page_start,c.page_end,
-          c.chapter,c.section,c.content_type,c.quality_score,
-          d.id AS document_id,d.title,d.category,d.tags,d.updated_at,
-          e.embedding
-         FROM document_chunks c
-         JOIN documents d ON d.id=c.document_id
-         JOIN chunk_embeddings e ON e.chunk_id=c.id
-         ${join}
-         WHERE e.model=? AND ${clauses.join(" AND ")}
-         ORDER BY d.updated_at DESC,c.id DESC
-         LIMIT 5000`,
-      )
-      .all(embeddingModelName(), ...parameters)) as SqlRow[];
-    const semanticHits = semanticRows
-      .map((row): SearchHit | undefined => {
+    if (embeddingModelEnabled()) {
+      const queryVector = (await embedTexts([query]))[0];
+      if (queryVector) {
+        const semanticRows = await getDb().prepare(
+          `${select},e.embedding ${from}
+           JOIN chunk_embeddings e ON e.chunk_id=c.id
+             AND e.generation=? AND e.provider=? AND e.model=?
+             AND e.stale=0 AND e.document_version=d.version
+           WHERE ${clauses.join(" AND ")}
+           ORDER BY c.id ASC`,
+        ).all(
+          embeddingGeneration(), embeddingProviderName(), embeddingModelName(), ...parameters,
+        );
+        vectorHits = semanticRows.map((row): SearchHit | undefined => {
         let vector: unknown;
         try {
           vector = JSON.parse(String(row.embedding));
@@ -352,63 +421,34 @@ export async function searchChunks(
         }
         const semanticScore = cosineSimilarity(queryVector, vector);
         if (semanticScore < embeddingMinimumScore()) return undefined;
-        const keywordScore = lexicalScore(
-          query,
-          String(row.content),
-          String(row.title),
-          String(row.tags),
-        );
         return {
-          chunk_id: Number(row.chunk_id),
-          chunk_index: Number(row.chunk_index),
-          document_id: Number(row.document_id),
-          title: String(row.title),
-          category: String(row.category),
-          tags: tagsFromJson(row.tags),
-          content: String(row.content),
-          page_start: row.page_start === null ? null : Number(row.page_start),
-          page_end: row.page_end === null ? null : Number(row.page_end),
-          chapter: row.chapter ? String(row.chapter) : null,
-          section: row.section ? String(row.section) : null,
-          content_type: String(row.content_type ?? "content") as SearchHit["content_type"],
-          quality_score: Number(row.quality_score ?? 1),
-          lexical_score: Number(keywordScore.toFixed(4)),
+          ...toHit(row),
           semantic_score: Number(semanticScore.toFixed(4)),
-          score: Number(
-            Math.min(1, semanticScore * 0.8 + keywordScore * 0.2).toFixed(4),
-          ),
+          embedding_generation: embeddingGeneration(),
+          score: Number(semanticScore.toFixed(4)),
         };
-      })
-      .filter((row): row is SearchHit => Boolean(row));
-    if (!semanticHits.length) {
-      return { engine: "lexical", hits: lexicalHits.slice(0, limit) };
-    }
-
-    const combined = new Map<number, SearchHit>(
-      semanticHits.map((row) => [row.chunk_id, row]),
-    );
-    for (const lexicalHit of lexicalHits) {
-      const existing = combined.get(lexicalHit.chunk_id);
-      if (existing) {
-        existing.score = Math.max(existing.score, lexicalHit.score);
-      } else {
-        combined.set(lexicalHit.chunk_id, {
-          ...lexicalHit,
-          score: Number((lexicalHit.score * 0.6).toFixed(4)),
-        });
+        }).filter((row): row is SearchHit => Boolean(row))
+          .sort((left, right) => (right.semantic_score ?? -1) - (left.semantic_score ?? -1))
+          .slice(0, candidateLimit);
       }
     }
-    return {
-      engine: "hybrid-vector-lexical",
-      hits: [...combined.values()]
-        .sort((left, right) => right.score - left.score)
-        .slice(0, limit),
-    };
   } catch (error) {
     console.warn(
       "Embedding search failed; using lexical fallback:",
       error instanceof Error ? error.message : error,
     );
-    return { engine: "lexical", hits: lexicalHits.slice(0, limit) };
   }
+  const channels: RankedChannel[] = [
+    { name: "content", weight: Number(process.env.RAG_RRF_CONTENT_WEIGHT ?? 1), hits: contentHits },
+    { name: "metadata", weight: Number(process.env.RAG_RRF_METADATA_WEIGHT ?? 1.25), hits: metadataHits },
+    { name: "exact", weight: Number(process.env.RAG_RRF_EXACT_WEIGHT ?? 1.25), hits: exactHits },
+  ];
+  if (vectorHits.length) channels.push({
+    name: "vector", weight: Number(process.env.RAG_RRF_VECTOR_WEIGHT ?? 1), hits: vectorHits,
+  });
+  const fused = weightedRrf(channels, Number(process.env.RAG_RRF_K ?? 60));
+  return {
+    engine: vectorHits.length ? "hybrid-vector-lexical" : "lexical",
+    hits: dedupeTopK(fused, limit),
+  };
 }

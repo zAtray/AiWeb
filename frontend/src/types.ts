@@ -6,7 +6,6 @@ export type ViewName =
   | "search"
   | "chat"
   | "shared"
-  | "profile"
   | "admin";
 
 export interface User {
@@ -87,6 +86,8 @@ export interface Citation {
   content: string;
   score: number;
   chunk_id: number;
+  chunk_ids?: number[];
+  document_version?: number;
   chunk_index: number;
   page_start: number | null;
   page_end: number | null;
@@ -140,6 +141,8 @@ export interface AppConfig {
     max_mb: number;
     allowed_extensions: string[];
     pdf_ocr_enabled: boolean;
+    ocr_available: boolean;
+    ocr_message: string;
     pdf_ocr_max_pages: number;
   };
 }
@@ -151,6 +154,16 @@ export interface SearchResponse {
   mode: "fulltext";
   retrieval_engine: RetrievalEngine;
   results: SearchHit[];
+  related_documents: RelatedDocument[];
+}
+
+export interface RelatedDocument {
+  id: number;
+  title: string;
+  category: string;
+  tags: string[];
+  score: number;
+  matched_fragments: number;
 }
 
 export interface ChatResponse {
@@ -158,16 +171,29 @@ export interface ChatResponse {
   answer: string;
   citations: Citation[];
   engine:
-    | "local-qwen3-rag"
-    | "local-extractive-fallback"
+    | "cloud-llm-api"
+    | "extractive-fallback"
     | "local-extractive"
-    | "local-qwen3-refinement"
     | "local-refinement-fallback"
     | "local-platform-query";
   retrieval_engine: RetrievalEngine | "none";
-  intent: "new_query" | "refinement" | "contextual_query" | "overview";
+  intent:
+    | "new_query"
+    | "refinement"
+    | "follow_up"
+    | "summarize_previous"
+    | "explain_previous"
+    | "continue_previous"
+    | "contextual_query"
+    | "overview";
+  retrieval_query: string;
+  original_query: string;
+  rewrite_applied: boolean;
+  retrieval_outcome: "sufficient" | "retrieval_insufficient";
+  generation_outcome: "supported" | "generation_unsupported" | "provider_failed";
   retrieval_performed: boolean;
   query_type: "local" | "overview";
+  retrieval_scope: "local" | "document_overview" | "chapter_overview";
   scope_document_ids: number[];
   scope_source: "query" | "history" | "dominant" | "knowledge_base" | "none";
 }
@@ -186,21 +212,24 @@ export interface DashboardStats {
   views: number;
   downloads: number;
   searches: number;
-  questions: number;
   categories: Array<{ name: string; value: number }>;
   hot_keywords: Array<{ name: string; value: number }>;
   search_trend: Array<{ date: string; value: number }>;
-  popular_documents: Array<{
-    id: number;
-    title: string;
-    views: number;
-    downloads: number;
-    likes: number;
-  }>;
-  latest_documents: Array<{
+  popularDocuments: Array<{
     id: number;
     title: string;
     category: string;
     created_at: string;
+    views: number;
+    downloads: number;
+    popularity: number;
+  }>;
+  latestDocuments: Array<{
+    id: number;
+    title: string;
+    category: string;
+    created_at: string;
+    views: number;
+    downloads: number;
   }>;
 }

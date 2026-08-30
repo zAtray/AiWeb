@@ -12,6 +12,8 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "127.0.0.1:3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
@@ -21,71 +23,5 @@ services:
       retries: 30
       start_period: 20s
 
-  ollama:
-    image: ollama/ollama:latest
-    restart: unless-stopped
-    volumes:
-      - ollama-data:/root/.ollama
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 5s
-      timeout: 10s
-      retries: 30
-      start_period: 10s
-
-  ollama-pull-chat:
-    image: ollama/ollama:latest
-    restart: "no"
-    environment:
-      OLLAMA_HOST: http://ollama:11434
-    command: ["pull", "qwen3:8b"]
-    depends_on:
-      ollama:
-        condition: service_healthy
-    volumes:
-      - ollama-data:/root/.ollama
-
-  ollama-pull-embedding:
-    image: ollama/ollama:latest
-    restart: "no"
-    environment:
-      OLLAMA_HOST: http://ollama:11434
-    command: ["pull", "qwen3-embedding:0.6b"]
-    depends_on:
-      ollama-pull-chat:
-        condition: service_completed_successfully
-    volumes:
-      - ollama-data:/root/.ollama
-
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    env_file:
-      - .env.docker
-    ports:
-      - "127.0.0.1:${APP_PORT:-8000}:8000"
-    volumes:
-      - app-data:/app/data
-    depends_on:
-      mysql:
-        condition: service_healthy
-      ollama-pull-embedding:
-        condition: service_completed_successfully
-    healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - fetch('http://127.0.0.1:8000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 20s
-
 volumes:
   mysql-data:
-  ollama-data:
-  app-data:
-

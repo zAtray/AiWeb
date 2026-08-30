@@ -56,30 +56,3 @@ export function createPendingController(
 
   return { pending, anyPending, isPending, run };
 }
-
-export function createThemeController() {
-  const theme = ref<"light" | "dark">("light");
-
-  function applyTheme(nextTheme: "light" | "dark"): void {
-    theme.value = nextTheme;
-    document.documentElement.dataset.theme = nextTheme;
-    window.localStorage.setItem("zhizhi-theme", nextTheme);
-  }
-
-  function initializeTheme(): void {
-    const savedTheme = window.localStorage.getItem("zhizhi-theme");
-    applyTheme(
-      savedTheme === "light" || savedTheme === "dark"
-        ? savedTheme
-        : window.matchMedia("(prefers-color-scheme: dark)").matches
-          ? "dark"
-          : "light",
-    );
-  }
-
-  function toggleTheme(): void {
-    applyTheme(theme.value === "light" ? "dark" : "light");
-  }
-
-  return { theme, applyTheme, initializeTheme, toggleTheme };
-}

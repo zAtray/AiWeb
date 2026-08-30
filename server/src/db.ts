@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS kb_documents (
 CREATE TABLE IF NOT EXISTS document_chunks (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   document_id BIGINT UNSIGNED NOT NULL,
+  document_version INT UNSIGNED NOT NULL DEFAULT 1,
   chunk_index INT UNSIGNED NOT NULL,
   content LONGTEXT NOT NULL,
   page_start INT UNSIGNED NULL,
@@ -134,14 +135,38 @@ CREATE TABLE IF NOT EXISTS document_chunks (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS chunk_embeddings (
-  chunk_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+  chunk_id BIGINT UNSIGNED NOT NULL,
+  provider VARCHAR(40) NOT NULL DEFAULT 'legacy',
   model VARCHAR(120) NOT NULL,
   dimensions INT UNSIGNED NOT NULL,
+  generation VARCHAR(80) NOT NULL DEFAULT 'legacy',
+  document_version INT UNSIGNED NOT NULL DEFAULT 0,
+  stale TINYINT(1) NOT NULL DEFAULT 1,
   embedding LONGTEXT NOT NULL,
   updated_at VARCHAR(32) NOT NULL,
-  KEY idx_chunk_embeddings_model (model),
+  PRIMARY KEY (chunk_id),
+  KEY idx_chunk_embeddings_space (provider,model,generation,stale),
   CONSTRAINT fk_chunk_embeddings_chunk
     FOREIGN KEY (chunk_id) REFERENCES document_chunks(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS rag_chunk_search (
+  chunk_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+  document_id BIGINT UNSIGNED NOT NULL,
+  document_version INT UNSIGNED NOT NULL,
+  content LONGTEXT NOT NULL,
+  title VARCHAR(150) NOT NULL,
+  filename VARCHAR(255) NOT NULL,
+  tags LONGTEXT NOT NULL,
+  chapter VARCHAR(160) NULL,
+  section VARCHAR(220) NULL,
+  FULLTEXT KEY ft_rag_content (content,chapter,section) WITH PARSER ngram,
+  FULLTEXT KEY ft_rag_metadata (title,filename,tags) WITH PARSER ngram,
+  KEY idx_rag_search_document_version (document_id,document_version),
+  CONSTRAINT fk_rag_search_chunk
+    FOREIGN KEY (chunk_id) REFERENCES document_chunks(id) ON DELETE CASCADE,
+  CONSTRAINT fk_rag_search_document
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -290,6 +315,7 @@ export async function initDb(): Promise<void> {
   );
   const existing = new Set(chunkColumns.map((row) => String(row.Field)));
   const additions = [
+    ["document_version", "INT UNSIGNED NOT NULL DEFAULT 1 AFTER document_id"],
     ["page_start", "INT UNSIGNED NULL"],
     ["page_end", "INT UNSIGNED NULL"],
     ["chapter", "VARCHAR(160) NULL"],
@@ -320,6 +346,48 @@ export async function initDb(): Promise<void> {
       "ALTER TABLE document_chunks ADD KEY idx_chunks_document_chapter (document_id,chapter)",
     );
   }
+  const [embeddingColumns] = await getPool().query<RowDataPacket[]>(
+    "SHOW COLUMNS FROM chunk_embeddings",
+  );
+  const embeddingExisting = new Set(
+    embeddingColumns.map((row) => String(row.Field)),
+  );
+  const embeddingAdditions = [
+    ["provider", "VARCHAR(40) NOT NULL DEFAULT 'legacy' AFTER chunk_id"],
+    ["generation", "VARCHAR(80) NOT NULL DEFAULT 'legacy' AFTER dimensions"],
+    ["document_version", "INT UNSIGNED NOT NULL DEFAULT 0 AFTER generation"],
+    ["stale", "TINYINT(1) NOT NULL DEFAULT 1 AFTER document_version"],
+  ] as const;
+  for (const [column, definition] of embeddingAdditions) {
+    if (!embeddingExisting.has(column)) {
+      await getPool().query(
+        `ALTER TABLE chunk_embeddings ADD COLUMN ${column} ${definition}`,
+      );
+    }
+  }
+  const [embeddingIndexes] = await getPool().query<RowDataPacket[]>(
+    "SHOW INDEX FROM chunk_embeddings WHERE Key_name='idx_chunk_embeddings_space'",
+  );
+  if (!embeddingIndexes.length) {
+    await getPool().query(
+      "ALTER TABLE chunk_embeddings ADD KEY idx_chunk_embeddings_space (provider,model,generation,stale)",
+    );
+  }
+  await getPool().query(
+    `UPDATE document_chunks c JOIN documents d ON d.id=c.document_id
+        SET c.document_version=d.version
+      WHERE c.document_version<>d.version`,
+  );
+  await getPool().query(
+    `INSERT INTO rag_chunk_search(
+       chunk_id,document_id,document_version,content,title,filename,tags,chapter,section
+     ) SELECT c.id,c.document_id,c.document_version,c.content,d.title,d.filename,d.tags,c.chapter,c.section
+         FROM document_chunks c JOIN documents d ON d.id=c.document_id
+     ON DUPLICATE KEY UPDATE
+       document_id=VALUES(document_id),document_version=VALUES(document_version),
+       content=VALUES(content),title=VALUES(title),filename=VALUES(filename),tags=VALUES(tags),
+       chapter=VALUES(chapter),section=VALUES(section)`,
+  );
   initialized = true;
 }
 

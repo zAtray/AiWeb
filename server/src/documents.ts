@@ -57,7 +57,7 @@ const highConfidenceAdvertisement = [
   /(?:兑换码|扫码添加|微信咨询|课程咨询|配套视频|盗版书)/u,
   /(?:邮购电话|质量投诉|侵权举报|图书有缺页)/u,
   /(?:王道训练营|就业咨询|获取就业数据)/u,
-  /(?:bilibili(?:\.com)?|哔哩哔哩|扫码|二维码|QQ群|QQs*群)/iu,
+  /(?:bilibili(?:\.com)?|哔哩哔哩|扫码|二维码|QQ群|QQ\s*群)/iu,
   /(?:下载网站|高清带书签|电子书仅供|严禁传播|关注公众号|加群领取)/u,
   /(?:http(?:s)?:\/\/|www\.|\.com\b|\.cn\b)/iu,
   /购买王道.{0,8}(?:就上|书店)/u,
@@ -172,16 +172,22 @@ function meaningfulRatio(value: string): number {
   return meaningful / compact.length;
 }
 
-function qualityScore(value: string): number {
+export function qualityScore(value: string): number {
   const compact = value.replace(/\s/gu, "");
   if (!compact) return 0;
   const replacementCount = value.match(/[\uFFFD\uE000-\uF8FF]/gu)?.length ?? 0;
   const ratio = meaningfulRatio(value);
   const replacementPenalty = replacementCount / compact.length;
-  const isolatedNoise = value.match(/(?:\b[A-Za-z]\b[\s,.;:_-]*){8,}/gu)?.length ?? 0;
+  const meaningfulCount = value.match(/[\p{Script=Han}A-Za-z0-9]/gu)?.length ?? 0;
+  const isolatedLetters = value.match(
+    /(?<![\p{L}\p{N}])[A-Za-z](?![\p{L}\p{N}])/gu,
+  )?.length ?? 0;
+  const isolatedLetterPenalty = meaningfulCount
+    ? Math.min(0.7, (isolatedLetters / meaningfulCount) * 0.8)
+    : 0;
   return Math.max(
     0,
-    Math.min(1, ratio - replacementPenalty * 4 - Math.min(0.35, isolatedNoise * 0.15)),
+    Math.min(1, ratio - replacementPenalty * 4 - isolatedLetterPenalty),
   );
 }
 
@@ -218,7 +224,7 @@ function chapterHeading(line: string): string | null {
 function sectionHeading(line: string): string | null {
   const normalized = normalizeLine(line);
   const match = normalized.match(
-    /^((?:[1-9]|10)\.\d{1,2}(?:\.\d{1,2})*)\s+[、._：:-]?\s*([\p{Script=Han}A-Za-z][^。！？!?]{0,49})/u,
+    /^((?:[1-9]\d?)\.\d{1,2}(?:\.\d{1,2})*)\s+[、._：:-]?\s*([\p{Script=Han}A-Za-z][^。！？!?]{0,49})/u,
   );
   return match ? `${match[1]} ${match[2]}`.trim() : null;
 }
@@ -280,10 +286,17 @@ async function popplerPdfPages(filePath: string): Promise<ExtractedPage[]> {
       maxBuffer: 256 * 1024 * 1024,
     },
   );
-  return result.stdout
-    .split("\f")
-    .map((text, index) => ({ page: index + 1, text: text.trim() }))
-    .filter((page) => page.text);
+  return pagesFromPopplerText(result.stdout);
+}
+
+export function pagesFromPopplerText(output: string): ExtractedPage[] {
+  const pageTexts = output.split("\f");
+  // pdftotext normally emits a trailing form-feed. It is a delimiter, not an
+  // extra PDF page. Interior empty entries are image-only pages and must stay
+  // visible so extractDocument can send those exact page numbers to OCR.
+  if (pageTexts.length > 1 && !pageTexts.at(-1)?.trim()) pageTexts.pop();
+  if (pageTexts.length === 1 && !pageTexts[0]?.trim()) return [];
+  return pageTexts.map((text, index) => ({ page: index + 1, text: text.trim() }));
 }
 
 export function normalizeUploadFilename(filename: string): string {
@@ -462,7 +475,8 @@ export function structuredChunks(
       if (!content) return;
       const score = qualityScore(content);
       const meaningful = content.match(/[\p{Script=Han}A-Za-z0-9]/gu)?.length ?? 0;
-      if (meaningful < 40 || score < 0.48 || isAdvertisement(content)) {
+      const shortHeading = currentType === "heading" && meaningful >= 4;
+      if ((!shortHeading && meaningful < 40) || score < 0.48 || isAdvertisement(content)) {
         audit.discardedLowQualityChunks += 1;
         return;
       }

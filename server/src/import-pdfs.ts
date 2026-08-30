@@ -3,7 +3,12 @@ import { createReadStream, createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { projectRoot, uploadDirectory } from "./config.js";
+import {
+  projectRoot,
+  resolveStoredPath,
+  storedPathFromAbsolute,
+  uploadDirectory,
+} from "./config.js";
 import { closeDb, getDb, initDb, nowIso, transaction } from "./db.js";
 import { extractDocument, type DocumentCleaningAudit } from "./documents.js";
 import { indexDocumentEmbeddings } from "./embeddings.js";
@@ -81,7 +86,9 @@ async function exactExistingDocument(hash: string, size: number): Promise<SqlRow
   for (const candidate of candidates) {
     const storedPath = String(candidate.stored_path ?? "");
     try {
-      if (storedPath && await sha256(storedPath) === hash) return candidate;
+      if (storedPath && await sha256(resolveStoredPath(storedPath)) === hash) {
+        return candidate;
+      }
     } catch {
       // A stale database row is not an idempotence match.
     }
@@ -180,6 +187,7 @@ async function importOne(
   }
 
   const storedPath = path.join(uploadDirectory, `${hash}.pdf`);
+  const storedReference = storedPathFromAbsolute(storedPath);
   try {
     await fs.access(storedPath);
     if (await sha256(storedPath) !== hash) throw new Error(`目标文件哈希冲突：${storedPath}`);
@@ -212,7 +220,7 @@ async function importOne(
           text_content,status,share_status,created_at,updated_at
         ) VALUES (?,?,?,?,?,?,?,? ,?,'ready','private',?,?)`,
       ).run(
-        ownerId, title, path.basename(source), storedPath, "PDF", stat.size,
+        ownerId, title, path.basename(source), storedReference, "PDF", stat.size,
         "2027考研教材", JSON.stringify(["王道", "2027", title]),
         extracted.text, timestamp, timestamp,
       );
@@ -220,7 +228,7 @@ async function importOne(
       await getDb().prepare(
         `INSERT INTO document_versions(document_id,version,filename,stored_path,file_size,created_at)
          VALUES (?,1,?,?,?,?)`,
-      ).run(id, path.basename(source), storedPath, stat.size, timestamp);
+      ).run(id, path.basename(source), storedReference, stat.size, timestamp);
       await linkKnowledgeBase(knowledgeBaseId, id);
       const chunks = await replaceChunks(id, extracted);
       const cleanedRows = await getDb().prepare(

@@ -1,7 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { hashPassword } from "./auth.js";
-import { dataDirectory, uploadDirectory } from "./config.js";
+import {
+  dataDirectory,
+  storedPathFromAbsolute,
+  uploadDirectory,
+} from "./config.js";
 import { closeDb, getDb, initDb, nowIso, transaction } from "./db.js";
 
 type Profile = "small" | "medium" | "large";
@@ -171,7 +175,14 @@ async function main(): Promise<void> {
       uploadDirectory,
       `${demoPrefix}-${String(index).padStart(4, "0")}.txt`,
     );
-    return { index, category, topic, content, storedPath };
+    return {
+      index,
+      category,
+      topic,
+      content,
+      storedPath,
+      storedReference: storedPathFromAbsolute(storedPath),
+    };
   });
   await Promise.all(
     files.map((file) => fs.writeFile(file.storedPath, file.content, "utf8")),
@@ -211,7 +222,7 @@ async function main(): Promise<void> {
         pick(userIds),
         `[演示] ${file.topic}案例 ${file.index}`,
         path.basename(file.storedPath),
-        file.storedPath,
+        file.storedReference,
         "TXT",
         Buffer.byteLength(file.content),
         file.category,
@@ -228,7 +239,7 @@ async function main(): Promise<void> {
       await insertVersion.run(
         documentId,
         path.basename(file.storedPath),
-        file.storedPath,
+        file.storedReference,
         Buffer.byteLength(file.content),
         date,
       );

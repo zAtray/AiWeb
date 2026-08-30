@@ -57,6 +57,14 @@ export interface OcrPage {
   text: string;
 }
 
+export interface OcrCapability {
+  enabled: boolean;
+  available: boolean;
+  languages: string[];
+  missing: string[];
+  message: string;
+}
+
 const defaultRunner: OcrCommandRunner = async (command, args, options) => {
   const result = await execFileAsync(command, args, {
     encoding: "utf8",
@@ -198,7 +206,12 @@ export async function ocrPdfPages(
   options: PdfOcrOptions = {},
 ): Promise<OcrPage[]> {
   const enabled = options.enabled ?? pdfOcrEnabled;
-  if (!enabled) return [];
+  if (!enabled) {
+    throw new ApiError(
+      503,
+      "当前环境未启用扫描 PDF OCR，文本型 PDF 仍可正常处理",
+    );
+  }
 
   const languages = options.languages ?? pdfOcrLanguages;
   const languageList = requestedLanguages(languages);
@@ -231,6 +244,18 @@ export async function ocrPdfPages(
   );
 
   try {
+    // Validate the PDF itself before checking optional OCR dependencies so a
+    // corrupt or encrypted upload is reported as a file error, not as a
+    // missing Tesseract installation.
+    const info = await run(runner, pdfInfoCommand, [filePath], deadline);
+    const pageCount = pdfPageCount(info.stdout);
+    if (pageCount > maxPages) {
+      throw new ApiError(
+        422,
+        `扫描 PDF 共 ${pageCount} 页，超过自动 OCR 上限 ${maxPages} 页`,
+      );
+    }
+
     const languageResult = await run(
       runner,
       tesseractCommand,
@@ -251,15 +276,6 @@ export async function ocrPdfPages(
       throw new ApiError(
         503,
         `服务器缺少 OCR 语言包：${missingLanguages.join("、")}`,
-      );
-    }
-
-    const info = await run(runner, pdfInfoCommand, [filePath], deadline);
-    const pageCount = pdfPageCount(info.stdout);
-    if (pageCount > maxPages) {
-      throw new ApiError(
-        422,
-        `扫描 PDF 共 ${pageCount} 页，超过自动 OCR 上限 ${maxPages} 页`,
       );
     }
 
@@ -340,6 +356,67 @@ export async function ocrPdfPages(
   } finally {
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
   }
+}
+
+let capabilityCache: { expiresAt: number; value: OcrCapability } | undefined;
+
+export async function detectOcrCapability(
+  runner: OcrCommandRunner = defaultRunner,
+  useCache = runner === defaultRunner,
+): Promise<OcrCapability> {
+  if (!pdfOcrEnabled) {
+    return {
+      enabled: false,
+      available: false,
+      languages: [],
+      missing: ["disabled"],
+      message: "当前环境未启用扫描 PDF OCR，文本型 PDF 仍可正常处理。",
+    };
+  }
+  if (useCache && capabilityCache && capabilityCache.expiresAt > Date.now()) {
+    return capabilityCache.value;
+  }
+  const requiredLanguages = requestedLanguages(pdfOcrLanguages);
+  const missing: string[] = [];
+  let installedLanguages: string[] = [];
+  const checks: Array<[string, string[], string]> = [
+    [pdfInfoPath, ["-v"], "pdfinfo"],
+    [pdfToPpmPath, ["-v"], "pdftoppm"],
+  ];
+  for (const [command, args, label] of checks) {
+    try {
+      await runner(command, args, { timeout: 3_000, maxBuffer: 1024 * 1024 });
+    } catch {
+      missing.push(label);
+    }
+  }
+  try {
+    const result = await runner(tesseractPath, ["--list-langs"], {
+      timeout: 3_000,
+      maxBuffer: 1024 * 1024,
+    });
+    installedLanguages = `${result.stdout}\n${result.stderr}`
+      .split(/\r?\n/u)
+      .map((item) => item.trim())
+      .filter((item) => /^[a-z0-9_]+$/iu.test(item));
+    for (const language of requiredLanguages) {
+      if (!installedLanguages.includes(language)) missing.push(`lang:${language}`);
+    }
+  } catch {
+    missing.push("tesseract");
+  }
+  const available = missing.length === 0;
+  const value: OcrCapability = {
+    enabled: true,
+    available,
+    languages: installedLanguages,
+    missing,
+    message: available
+      ? "支持扫描 PDF OCR。"
+      : "当前环境未完整启用扫描 PDF OCR，文本型 PDF 仍可正常处理。",
+  };
+  if (useCache) capabilityCache = { expiresAt: Date.now() + 60_000, value };
+  return value;
 }
 
 export async function ocrPdf(

@@ -23,7 +23,7 @@ const w = requireWorkspace(inject(workspaceKey));
 
     <nav class="header-links" :class="{ open: w.mobileNav.value }" aria-label="全局导航">
       <button
-        v-for="item in navigation.filter((entry) => entry.id !== 'profile' && entry.id !== 'admin')"
+        v-for="item in navigation.filter((entry) => entry.id !== 'admin')"
         :key="item.id"
         :class="{ active: w.activeView.value === item.id }"
         @click="w.changeView(item.id)"
@@ -37,18 +37,6 @@ const w = requireWorkspace(inject(workspaceKey));
       <button class="header-new-chat" @click="w.startNewChat">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
         新建会话
-      </button>
-      <button
-        class="theme-toggle"
-        :title="w.theme.value === 'light' ? '切换到深色模式' : '切换到浅色模式'"
-        @click="w.toggleTheme"
-      >
-        <svg v-if="w.theme.value === 'light'" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <path d="M20 15.2A8 8 0 0 1 8.8 4 8 8 0 1 0 20 15.2Z" />
-        </svg>
-        <svg v-else viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4" />
-        </svg>
       </button>
       <div class="account-menu-wrap" @click.stop>
         <button
@@ -68,7 +56,6 @@ const w = requireWorkspace(inject(workspaceKey));
               <div><b>{{ w.user.value.username }}</b><small>{{ roleLabel(w.user.value.role) }}</small></div>
             </div>
             <div class="account-popover-divider"></div>
-            <button role="menuitem" @click="w.changeView('profile')"><span>个人中心</span><i>›</i></button>
             <button v-if="w.isAdmin.value" role="menuitem" @click="w.changeView('admin')"><span>管理审核</span><i>›</i></button>
             <div class="account-popover-divider"></div>
             <button class="account-menu-logout" role="menuitem" @click="w.logout"><span>退出登录</span></button>

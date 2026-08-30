@@ -28,9 +28,10 @@ onBeforeUnmount(() => {
           <b>{{ w.uploadForm.file?.name || "选择知识文档" }}</b>
           <small>
             {{ w.uploadAccept.value.toUpperCase() }} · 不超过 {{ w.config.value.upload.max_mb }} MB
-            <template v-if="w.config.value.upload.pdf_ocr_enabled">
+            <template v-if="w.config.value.upload.ocr_available">
               · 扫描 PDF 自动 OCR（最多 {{ w.config.value.upload.pdf_ocr_max_pages }} 页）
             </template>
+            <template v-else> · {{ w.config.value.upload.ocr_message }}</template>
           </small>
         </label>
         <input v-model="w.uploadForm.title" maxlength="150" placeholder="显示标题（可选）" />
